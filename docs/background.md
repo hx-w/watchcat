@@ -71,4 +71,5 @@ Start-ScheduledTask -TaskName "Watchcat"
 ```
 
 The watchlist remains the authorization boundary. Stopping a service does not
-remove sessions from it; use `watchcat remove SESSION_ID` to revoke a session.
+remove sessions from it; use `watchcat watch remove SESSION_ID` to revoke a
+session.

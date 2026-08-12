@@ -27,15 +27,16 @@ the pull request.
 5. Add parser tests, engine integration tests with a fake provider, and a
    read-only live smoke procedure.
 
-Retry classifications are security-sensitive. A new retryable error requires
+Condition defaults are security-sensitive. A new retry condition requires
 evidence that it cannot represent approval, authentication, billing, quota,
 context, policy, or user-decision failures.
 
 ## Compatibility
 
 Do not rewrite state files from an unknown future schema version. New fields
-must have safe defaults. Renaming a provider, command, state key, or config
-field requires a migration and a changelog entry.
+must have safe defaults within a schema version. A release may intentionally
+replace commands or storage schemas when the changelog and README state the
+breaking change and give an explicit reset or migration procedure.
 
 ## Release process
 

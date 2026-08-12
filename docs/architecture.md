@@ -1,79 +1,91 @@
 # Architecture
 
-Watchcat separates product integration from recovery policy. A provider may
-change its transport or schema without changing which failures Watchcat is
-allowed to recover.
+Watchcat separates provider integration, failure classification, recovery
+policy, and observability. Provider-specific error names never control retry
+behavior directly.
 
 ```text
 CLI / service runner
         |
         v
-WatchEngine ---- WatchlistStore
-    |   |        RuntimeStateStore
-    |   +---- backoff / rate limit / dedupe / race check
+WatchEngine -------- WatchlistStore
+    |   |             RuntimeState
+    |   +-----------> EventLogStore (JSONL)
+    |   +-----------> condition policy / backoff / prompt rendering
     |
 Provider contract
     |
     +---- CodexProvider ---- JSON-RPC stdio ---- codex app-server
     |
-    +---- future ClaudeProvider
+    +---- future session adapters
+
+Provider errors ---- classifier ---- condition ---- policy ---- action
 ```
+
+## Conditions and policies
+
+A provider adapter translates a structured upstream failure into a stable
+condition such as `network.stream_failed`, `capacity.model_overloaded`, or
+`capability.model_unavailable`. The engine resolves that condition through the
+user's policy. Providers do not decide whether to send a continuation.
+
+The built-in defaults retry transient network, capacity, conflict, and server
+conditions. Authentication, billing, capability, context, quota, request,
+sandbox, and unknown conditions are skipped. Unknown input always fails closed.
+
+Each retry policy owns its action, backoff kind, initial and maximum delay,
+attempt limit, and prompt template. `retry_after_seconds` from a provider is a
+minimum delay and cannot shorten the configured backoff.
 
 ## Provider contract
 
-Each provider implements:
+Each session adapter implements:
 
 1. `start()` and `close()` for resource ownership.
-2. `list_sessions()` for read-only discovery.
-3. `latest_failure()` to translate the provider's newest turn into a generic
-   `Failure` or return `None`.
-4. `resume()` to create one continuation turn.
-5. `wait_for_change()` as an optional wakeup optimization. The default is
-   polling, so change notifications are never required for correctness.
+2. `list_sessions()` for discovery.
+3. `session_logs()` for provider-native turns and messages.
+4. `latest_failure()` for normalized failure detection.
+5. `resume()` for one continuation turn.
+6. `wait_for_change()` as an optional wakeup optimization.
 
-Provider errors are data translation, transport, or authentication concerns.
-Retry eligibility is emitted as part of `Failure`, but the provider must be
-conservative: ambiguity means `retryable = false`.
+Claude Code's official `StopFailure` codes are normalized and tested in the
+shared classifier. This release does not include a Claude session adapter or
+claim that it can resume Claude sessions.
 
 ## Recovery invariants
 
-The engine enforces these invariants for every provider:
-
 - A session is mutable only when it appears in the explicit watchlist.
-- One failure turn is handled at most once.
-- A retry is delayed and bounded per session.
-- The latest failure is read again immediately before `resume()`.
-- A newer completed, active, or failed turn cancels the pending action.
-- Dry-run mode never records a failure as handled.
-- Only one watchdog process may own a state directory.
+- One failed turn is handled at most once.
+- Retry attempts are delayed and bounded per session and time window.
+- The latest failed turn is read again immediately before `resume()`.
+- A changed session cancels the pending continuation.
+- Dry-run mode never sends a prompt or marks a failure handled.
+- One watchdog process may own a state directory.
+- Provider and Watchcat events are retained as bounded JSONL history.
 
 ## Codex adapter
 
-The adapter launches `codex app-server --listen stdio://`, initializes the
-JSON-RPC connection, and reads all interactive source kinds. Desktop tasks are
-persisted as Codex threads and are visible to an independent App Server process.
+The adapter starts `codex app-server --listen stdio://`, initializes the
+JSON-RPC connection, and reads interactive Codex threads. `thread/read` supplies
+structured turns and message items for `session logs`. Recovery uses
+`thread/resume`, followed by `turn/start` with the rendered policy prompt.
 
-For low latency the adapter registers `fs/watch` on watched rollout files. A
-periodic reconciliation still runs after every timeout, covering lost file
-events, unsupported watch APIs, and restarts. `thread/turns/list` is used for a
-bounded latest-turn read; older App Servers fall back to `thread/read`.
+Filesystem notifications reduce latency. Periodic reconciliation remains the
+correctness fallback for lost events, unsupported watch APIs, and restarts.
 
-Resume is a two-step operation: `thread/resume`, then `turn/start`. The engine's
-second latest-turn check happens before those calls.
+## Storage contract
 
-## Compatibility policy
+Configuration, watchlist, and runtime-state documents use schema version 2.
+Watchcat 0.2 intentionally does not migrate version 1 files. Replace an old
+configuration with `watchcat config init --force`, then rebuild the watchlist.
 
-- State and watchlist files carry integer schema versions.
-- Unknown configuration fields fail closed. New optional fields must have safe
-  defaults so older state remains readable by newer releases.
-- Unsupported higher schema versions fail closed instead of being rewritten.
-- Provider names are part of durable keys (`provider:session:turn`).
-- Existing provider semantics cannot be silently broadened by adding another
-  provider.
+The event log is append-only JSONL with bounded compaction. It may contain
+failure messages and the exact continuation prompts Watchcat sent, but it does
+not copy full provider conversations. Provider messages are read on demand.
 
 ## Threat model
 
-Watchcat assumes the local account already has authority to use the watched
-agent sessions. A malicious local user who can modify the watchlist or state
-directory already has equivalent account access. Watchcat does not expose a
-network listener and does not store provider credentials.
+Watchcat assumes the local account already has authority to use watched agent
+sessions. It exposes no network listener and stores no provider credentials.
+Anyone who can edit the configuration, watchlist, or state directory should be
+treated as having equivalent local account access.

@@ -103,7 +103,7 @@ impl JsonRpcClient {
                         } else if let Some(id) = message.get("id").and_then(Value::as_u64) {
                             if let Some(sender) = pending.lock().await.remove(&id) {
                                 let result = if let Some(error) = message.get("error") {
-                                    Err(anyhow!(parse_rpc_error(error)))
+                                    Err(parse_rpc_error(error).into())
                                 } else {
                                     Ok(message.get("result").cloned().unwrap_or(Value::Null))
                                 };

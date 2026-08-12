@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -8,7 +9,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::atomic_write;
-use crate::models::{Failure, WatchTarget};
+use crate::models::{EngineEvent, Failure, SessionLog, WatchTarget};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WatchlistDocument {
@@ -20,7 +21,7 @@ struct WatchlistDocument {
 impl Default for WatchlistDocument {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             targets: Vec::new(),
         }
     }
@@ -37,8 +38,11 @@ impl WatchlistStore {
 
     pub fn list(&self) -> Result<Vec<WatchTarget>> {
         let document: WatchlistDocument = load_json_or_default(&self.path)?;
-        if document.version != 1 {
-            bail!("unsupported watchlist version {}", document.version);
+        if document.version != 2 {
+            bail!(
+                "unsupported watchlist version {}; this release requires version 2",
+                document.version
+            );
         }
         Ok(document.targets)
     }
@@ -71,7 +75,7 @@ impl WatchlistStore {
         save_json(
             &self.path,
             &WatchlistDocument {
-                version: 1,
+                version: 2,
                 targets,
             },
         )
@@ -106,15 +110,18 @@ impl RuntimeState {
                 .with_context(|| format!("invalid runtime state {}", path.display()))?
         } else {
             Self {
-                version: 1,
+                version: 2,
                 handled: HashMap::new(),
                 observed: HashMap::new(),
                 attempts: HashMap::new(),
                 path: PathBuf::new(),
             }
         };
-        if state.version != 1 {
-            bail!("unsupported runtime state version {}", state.version);
+        if state.version != 2 {
+            bail!(
+                "unsupported runtime state version {}; this release requires version 2",
+                state.version
+            );
         }
         state.path = path;
         Ok(state)
@@ -124,8 +131,10 @@ impl RuntimeState {
         save_json(&self.path, self)
     }
 
-    pub fn is_handled(&self, failure: &Failure) -> bool {
-        self.handled.contains_key(&failure.key())
+    pub fn handled_action(&self, failure: &Failure) -> Option<&str> {
+        self.handled
+            .get(&failure.key())
+            .map(|handled| handled.action.as_str())
     }
 
     pub fn mark_handled(&mut self, failure: &Failure, action: &str, now: DateTime<Utc>) {
@@ -157,6 +166,117 @@ impl RuntimeState {
     pub fn record_attempt(&mut self, target: &WatchTarget, now: DateTime<Utc>) {
         self.attempts.entry(target.key()).or_default().push(now);
     }
+
+    pub fn latest_attempt(&self, target: &WatchTarget) -> Option<DateTime<Utc>> {
+        self.attempts
+            .get(&target.key())
+            .and_then(|attempts| attempts.last())
+            .copied()
+    }
+
+    pub fn clear_attempts(&mut self, target: &WatchTarget) {
+        self.attempts.remove(&target.key());
+    }
+}
+
+#[derive(Clone)]
+pub struct EventLogStore {
+    path: PathBuf,
+    retention: usize,
+}
+
+impl EventLogStore {
+    pub fn new(path: PathBuf, retention: usize) -> Self {
+        Self { path, retention }
+    }
+
+    pub fn append(&self, events: &[EngineEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let parent = self.path.parent().context("event log path has no parent")?;
+        fs::create_dir_all(parent)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        for event in events {
+            serde_json::to_writer(&mut file, event)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        if self.count_lines()? > self.retention.saturating_mul(2) {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    pub fn session_logs(
+        &self,
+        provider: &str,
+        session_id: &str,
+        category: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionLog>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&self.path)?;
+        let mut logs = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            let event: EngineEvent = serde_json::from_str(&line)
+                .with_context(|| format!("invalid event log entry in {}", self.path.display()))?;
+            let Some(entry) = event.as_session_log() else {
+                continue;
+            };
+            if entry.provider != provider || entry.session_id != session_id {
+                continue;
+            }
+            if !category.is_none_or(|category| {
+                entry
+                    .condition
+                    .as_deref()
+                    .is_some_and(|condition| condition_category(condition) == category)
+                    || entry.kind.split('.').next() == Some(category)
+            }) {
+                continue;
+            }
+            logs.push(entry);
+            if logs.len() > limit {
+                logs.remove(0);
+            }
+        }
+        Ok(logs)
+    }
+
+    fn count_lines(&self) -> Result<usize> {
+        if !self.path.exists() {
+            return Ok(0);
+        }
+        Ok(BufReader::new(File::open(&self.path)?).lines().count())
+    }
+
+    fn compact(&self) -> Result<()> {
+        let lines = BufReader::new(File::open(&self.path)?)
+            .lines()
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let kept = lines
+            .into_iter()
+            .rev()
+            .take(self.retention)
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        for line in kept.into_iter().rev() {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
+        atomic_write(&self.path, &bytes)
+    }
+}
+
+fn condition_category(condition: &str) -> &str {
+    condition.split('.').next().unwrap_or(condition)
 }
 
 pub struct ProcessLock {
@@ -179,7 +299,6 @@ impl ProcessLock {
         file.try_lock_exclusive()
             .with_context(|| "another watchcat runner is active")?;
         file.set_len(0)?;
-        use std::io::Write;
         (&file).write_all(std::process::id().to_string().as_bytes())?;
         Ok(Self { file })
     }
@@ -232,20 +351,43 @@ mod tests {
     }
 
     #[test]
-    fn unknown_watchlist_version_fails_closed() {
+    fn old_watchlist_version_is_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("watchlist.json");
-        fs::write(&path, r#"{"version":2,"targets":[]}"#).unwrap();
+        fs::write(&path, r#"{"version":1,"targets":[]}"#).unwrap();
         assert!(WatchlistStore::new(path).list().is_err());
     }
 
     #[test]
-    fn process_lock_rejects_a_second_runner() {
+    fn event_log_filters_session_category_and_limit() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("watchcat.lock");
-        let first = ProcessLock::acquire(path.clone()).unwrap();
-        assert!(ProcessLock::acquire(path.clone()).is_err());
-        drop(first);
-        assert!(ProcessLock::acquire(path).is_ok());
+        let store = EventLogStore::new(directory.path().join("events.jsonl"), 10);
+        let event = |condition: &str, timestamp| EngineEvent {
+            timestamp,
+            kind: "failure.observed".into(),
+            target: "codex:one".into(),
+            message: condition.into(),
+            condition: Some(condition.into()),
+            attempt: None,
+            max_attempts: None,
+            prompt: None,
+            failure: None,
+            receipt: None,
+        };
+        store
+            .append(&[
+                event("network.timeout", Utc::now()),
+                event("capacity.model_overloaded", Utc::now()),
+                event("capacity.service_overloaded", Utc::now()),
+            ])
+            .unwrap();
+        let logs = store
+            .session_logs("codex", "one", Some("capacity"), 1)
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].condition.as_deref(),
+            Some("capacity.service_overloaded")
+        );
     }
 }

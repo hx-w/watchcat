@@ -1,3 +1,4 @@
+mod claude;
 mod codex;
 
 use std::time::Duration;
@@ -5,8 +6,9 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::models::{Failure, ResumeReceipt, Session};
+use crate::models::{Failure, ResumeReceipt, Session, SessionLog};
 
+pub use claude::{classify_claude_error, classify_claude_hook};
 pub use codex::{CodexProvider, classify_codex_error};
 
 #[async_trait]
@@ -15,6 +17,7 @@ pub trait Provider: Send {
     async fn start(&mut self) -> Result<()>;
     async fn close(&mut self) -> Result<()>;
     async fn list_sessions(&mut self, limit: usize) -> Result<Vec<Session>>;
+    async fn session_logs(&mut self, session_id: &str, limit: usize) -> Result<Vec<SessionLog>>;
     async fn latest_failure(&mut self, session_id: &str) -> Result<Option<Failure>>;
     async fn resume(&mut self, session_id: &str, prompt: &str) -> Result<ResumeReceipt>;
 

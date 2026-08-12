@@ -1,13 +1,20 @@
-# Copy to ~/.config/watchcat/config.toml or run `watchcat init`.
-version = 1
+# Copy to the path printed by `watchcat config path`, or run `watchcat config init`.
+version = 2
 
 [engine]
 poll_interval_seconds = 10
-max_attempts = 3
 attempt_window_seconds = 3600
-backoff_seconds = [5, 30, 120]
-resume_prompt = "Continue the previous unfinished task. First inspect the last checkpoint and any changes already persisted to disk. Do not redo completed work."
+log_retention = 10000
 
 [providers.codex]
 enabled = true
 command = ["codex", "app-server", "--listen", "stdio://"]
+
+# Prefer `watchcat policy set` over editing policy tables by hand.
+[policies."capacity.model_overloaded"]
+action = "retry"
+backoff = "exponential"
+initial_delay_seconds = 15
+max_delay_seconds = 300
+max_attempts = 5
+prompt = "The {model} model is overloaded. Continue the unfinished task. Attempt {attempt}/{max_attempts}."

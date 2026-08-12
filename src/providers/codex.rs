@@ -10,16 +10,9 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::config::CodexSettings;
-use crate::models::{Failure, ResumeReceipt, Session, SessionState};
+use crate::models::{Failure, ResumeReceipt, Session, SessionLog, SessionState};
 use crate::providers::Provider;
 use crate::transport::jsonrpc::{JsonRpcClient, JsonRpcError};
-
-const RETRYABLE_CODES: &[&str] = &[
-    "HttpConnectionFailed",
-    "ResponseStreamConnectionFailed",
-    "ResponseStreamDisconnected",
-    "ResponseTooManyFailedAttempts",
-];
 
 const SOURCE_KINDS: &[&str] = &[
     "cli",
@@ -197,6 +190,30 @@ impl Provider for CodexProvider {
         Ok(sessions)
     }
 
+    async fn session_logs(&mut self, session_id: &str, limit: usize) -> Result<Vec<SessionLog>> {
+        self.require_started()?;
+        let result = self
+            .client
+            .request(
+                "thread/read",
+                json!({"threadId": session_id, "includeTurns": true}),
+            )
+            .await?;
+        let turns = result
+            .pointer("/thread/turns")
+            .and_then(Value::as_array)
+            .context("Codex thread/read returned invalid turns")?;
+        let start = turns.len().saturating_sub(limit);
+        let mut logs = Vec::new();
+        for turn in &turns[start..] {
+            logs.extend(codex_turn_logs(session_id, turn));
+        }
+        if logs.len() > limit {
+            logs.drain(..logs.len() - limit);
+        }
+        Ok(logs)
+    }
+
     async fn latest_failure(&mut self, session_id: &str) -> Result<Option<Failure>> {
         self.require_started()?;
         let result = self
@@ -245,19 +262,26 @@ impl Provider for CodexProvider {
             .get("id")
             .and_then(Value::as_str)
             .context("Codex returned a failed turn without an id")?;
-        let (code, retryable) = classify_codex_error(error);
+        let classified = classify_codex_error(error);
         Ok(Some(Failure {
             provider: "codex".into(),
             session_id: session_id.into(),
             turn_id: turn_id.into(),
-            code,
+            condition: classified.condition,
+            provider_code: classified.provider_code,
             message: error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("Codex turn failed")
                 .into(),
-            retryable,
             occurred_at: parse_timestamp(turn.get("completedAt")),
+            retry_after_seconds: classified.retry_after_seconds,
+            model: turn.get("model").and_then(Value::as_str).map(str::to_owned),
+            scope: classified.scope,
+            metadata: error
+                .get("additionalDetails")
+                .cloned()
+                .unwrap_or(Value::Null),
         }))
     }
 
@@ -332,7 +356,15 @@ impl Provider for CodexProvider {
     }
 }
 
-pub fn classify_codex_error(error: &Value) -> (String, bool) {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassifiedError {
+    pub condition: String,
+    pub provider_code: String,
+    pub retry_after_seconds: Option<u64>,
+    pub scope: Option<String>,
+}
+
+pub fn classify_codex_error(error: &Value) -> ClassifiedError {
     let mut code = codex_error_code(error.get("codexErrorInfo"));
     let message = error
         .get("message")
@@ -348,13 +380,37 @@ pub fn classify_codex_error(error: &Value) -> (String, bool) {
             code
         };
     }
-    let mut retryable = RETRYABLE_CODES.contains(&code.as_str());
-    if code == "HttpConnectionFailed" {
-        if let Some(status) = http_status(error.get("codexErrorInfo")) {
-            retryable = matches!(status, 408 | 409 | 425 | 429) || status >= 500;
+    let status = http_status(error.get("codexErrorInfo"));
+    let (condition, scope) = match code.as_str() {
+        "ContextWindowExceeded" => ("context.window_exceeded", None),
+        "UsageLimitExceeded" => ("quota.usage_exhausted", None),
+        "HttpConnectionFailed" => match status {
+            Some(408) => ("network.timeout", None),
+            Some(409 | 425) => ("service.conflict", None),
+            Some(429) => ("capacity.rate_limited", None),
+            Some(529) => ("capacity.service_overloaded", Some("service")),
+            Some(401 | 403) => ("auth.invalid", None),
+            Some(413) => ("request.too_large", None),
+            Some(value) if (400..500).contains(&value) => ("request.invalid", None),
+            Some(value) if value >= 500 => ("service.server_error", None),
+            _ => ("network.connection_failed", None),
+        },
+        "ResponseStreamConnectionFailed" | "ResponseStreamDisconnected" => {
+            ("network.stream_failed", None)
         }
+        "ResponseTooManyFailedAttempts" => ("retry.provider_exhausted", None),
+        "BadRequest" => ("request.invalid", None),
+        "Unauthorized" => ("auth.invalid", None),
+        "SandboxError" => ("sandbox.failed", None),
+        "InternalServerError" => ("service.server_error", None),
+        _ => ("failure.unknown", None),
+    };
+    ClassifiedError {
+        condition: condition.into(),
+        provider_code: code,
+        retry_after_seconds: retry_after(error),
+        scope: scope.map(str::to_owned),
     }
-    (code, retryable)
 }
 
 fn codex_error_code(value: Option<&Value>) -> String {
@@ -369,7 +425,7 @@ fn codex_error_code(value: Option<&Value>) -> String {
             let known = object
                 .keys()
                 .map(|key| canonical_error_code(key))
-                .filter(|key| RETRYABLE_CODES.contains(&key.as_str()))
+                .filter(|key| key != "Other")
                 .collect::<Vec<_>>();
             if known.len() == 1 {
                 known[0].clone()
@@ -393,8 +449,106 @@ fn canonical_error_code(code: &str) -> String {
         "responseTooManyFailedAttempts" | "ResponseTooManyFailedAttempts" => {
             "ResponseTooManyFailedAttempts".into()
         }
+        "contextWindowExceeded" | "ContextWindowExceeded" => "ContextWindowExceeded".into(),
+        "usageLimitExceeded" | "UsageLimitExceeded" => "UsageLimitExceeded".into(),
+        "badRequest" | "BadRequest" => "BadRequest".into(),
+        "unauthorized" | "Unauthorized" => "Unauthorized".into(),
+        "sandboxError" | "SandboxError" => "SandboxError".into(),
+        "internalServerError" | "InternalServerError" => "InternalServerError".into(),
         _ => "Other".into(),
     }
+}
+
+fn retry_after(error: &Value) -> Option<u64> {
+    error
+        .pointer("/additionalDetails/retryAfterSeconds")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            error
+                .pointer("/codexErrorInfo/retryAfterSeconds")
+                .and_then(Value::as_u64)
+        })
+}
+
+fn codex_turn_logs(session_id: &str, turn: &Value) -> Vec<SessionLog> {
+    let status = turn
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let (condition, message) = if status == "failed" {
+        let fallback = json!({"message": "Codex turn failed without structured error details"});
+        let error = turn.get("error").unwrap_or(&fallback);
+        (
+            Some(classify_codex_error(error).condition),
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Codex turn failed")
+                .to_owned(),
+        )
+    } else {
+        (None, format!("turn {status}"))
+    };
+    let timestamp =
+        parse_timestamp(turn.get("completedAt")).or_else(|| parse_timestamp(turn.get("startedAt")));
+    let turn_id = turn.get("id").and_then(Value::as_str).map(str::to_owned);
+    let mut logs = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| codex_item_log(session_id, turn_id.clone(), timestamp, item))
+        .collect::<Vec<_>>();
+    logs.push(SessionLog {
+        timestamp,
+        provider: "codex".into(),
+        session_id: session_id.into(),
+        source: "provider".into(),
+        kind: format!("turn.{status}"),
+        role: None,
+        turn_id,
+        condition,
+        message,
+        metadata: json!({"model": turn.get("model")}),
+    });
+    logs
+}
+
+fn codex_item_log(
+    session_id: &str,
+    turn_id: Option<String>,
+    timestamp: Option<DateTime<Utc>>,
+    item: &Value,
+) -> Option<SessionLog> {
+    let item_type = item.get("type")?.as_str()?;
+    let (role, message) = match item_type {
+        "userMessage" => {
+            let message = item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|content| content.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|content| content.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ("user", message)
+        }
+        "agentMessage" => ("assistant", item.get("text")?.as_str()?.to_owned()),
+        _ => return None,
+    };
+    Some(SessionLog {
+        timestamp,
+        provider: "codex".into(),
+        session_id: session_id.into(),
+        source: "provider".into(),
+        kind: "message".into(),
+        role: Some(role.into()),
+        turn_id,
+        condition: None,
+        message,
+        metadata: json!({"item_id": item.get("id")}),
+    })
 }
 
 fn http_status(value: Option<&Value>) -> Option<u64> {
@@ -480,46 +634,70 @@ mod tests {
 
     #[test]
     fn classifies_structured_network_failures() {
-        let (code, retryable) = classify_codex_error(&json!({
+        let classified = classify_codex_error(&json!({
             "message": "failed",
             "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": null}}
         }));
-        assert_eq!(code, "ResponseStreamDisconnected");
-        assert!(retryable);
+        assert_eq!(classified.provider_code, "ResponseStreamDisconnected");
+        assert_eq!(classified.condition, "network.stream_failed");
     }
 
     #[test]
-    fn refuses_non_transient_http_failures() {
-        let (_, retryable) = classify_codex_error(&json!({
+    fn maps_unauthorized_http_failures_to_auth() {
+        let classified = classify_codex_error(&json!({
             "message": "unauthorized",
             "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}}
         }));
-        assert!(!retryable);
+        assert_eq!(classified.condition, "auth.invalid");
+    }
+
+    #[test]
+    fn does_not_retry_other_client_errors_as_network_failures() {
+        let classified = classify_codex_error(&json!({
+            "message": "unprocessable",
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 422}}
+        }));
+        assert_eq!(classified.condition, "request.invalid");
     }
 
     #[test]
     fn accepts_legacy_pascal_case_structured_code() {
-        let (code, retryable) = classify_codex_error(&json!({
+        let classified = classify_codex_error(&json!({
             "message": "failed",
             "codexErrorInfo": {"type": "ResponseStreamConnectionFailed"}
         }));
-        assert_eq!(code, "ResponseStreamConnectionFailed");
-        assert!(retryable);
+        assert_eq!(classified.provider_code, "ResponseStreamConnectionFailed");
+        assert_eq!(classified.condition, "network.stream_failed");
     }
 
     #[test]
     fn recognizes_legacy_disconnect_message() {
-        let (code, retryable) = classify_codex_error(&json!({
+        let classified = classify_codex_error(&json!({
             "message": "stream disconnected before completion: error sending request"
         }));
-        assert_eq!(code, "ResponseStreamDisconnected");
-        assert!(retryable);
+        assert_eq!(classified.provider_code, "ResponseStreamDisconnected");
+        assert_eq!(classified.condition, "network.stream_failed");
     }
 
     #[test]
     fn unknown_error_fails_closed() {
-        let (code, retryable) = classify_codex_error(&json!({"message": "sandbox exploded"}));
-        assert_eq!(code, "Other");
-        assert!(!retryable);
+        let classified = classify_codex_error(&json!({"message": "sandbox exploded"}));
+        assert_eq!(classified.provider_code, "Other");
+        assert_eq!(classified.condition, "failure.unknown");
+    }
+
+    #[test]
+    fn maps_overload_and_usage_limit_distinctly() {
+        let overload = classify_codex_error(&json!({
+            "message": "overloaded",
+            "codexErrorInfo": {"type": "HttpConnectionFailed", "httpStatusCode": 529}
+        }));
+        assert_eq!(overload.condition, "capacity.service_overloaded");
+        assert_eq!(overload.scope.as_deref(), Some("service"));
+        let quota = classify_codex_error(&json!({
+            "message": "usage exhausted",
+            "codexErrorInfo": {"type": "UsageLimitExceeded"}
+        }));
+        assert_eq!(quota.condition, "quota.usage_exhausted");
     }
 }
