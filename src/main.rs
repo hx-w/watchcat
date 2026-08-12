@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -71,6 +72,8 @@ enum SessionCommand {
     Show(SessionIdArgs),
     /// Show recent provider and Watchcat events for one session.
     Logs(SessionLogsArgs),
+    /// Send a message by steering an active turn or starting a new turn.
+    Send(SessionSendArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,6 +171,17 @@ struct SessionLogsArgs {
     /// Filter by condition or event category, such as network or retry.
     #[arg(long)]
     category: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionSendArgs {
+    session_id: String,
+    /// Message text. Omit to read a multi-line message from standard input.
+    message: Option<String>,
+    #[arg(long, default_value = "codex")]
+    provider: String,
     #[arg(long)]
     json: bool,
 }
@@ -291,7 +305,64 @@ async fn session_command(
             emit_serializable(&session, args.json)
         }
         SessionCommand::Logs(args) => session_logs(settings, paths, args).await,
+        SessionCommand::Send(args) => send_session_message(settings, args).await,
     }
+}
+
+async fn send_session_message(settings: &Settings, args: SessionSendArgs) -> Result<()> {
+    let message = message_input(args.message)?;
+    let mut providers = started_provider(settings, &args.provider).await?;
+    let result = async {
+        let provider = providers
+            .get_mut(&args.provider)
+            .context("provider was not constructed")?;
+        provider
+            .send_message(&args.session_id, &message)
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot send to {} session {}",
+                    args.provider, args.session_id
+                )
+            })
+    }
+    .await;
+    close_providers(&mut providers).await;
+    let receipt = result?;
+    if args.json {
+        emit_serializable(&receipt, true)
+    } else {
+        let action = match receipt.delivery {
+            watchcat::models::MessageDelivery::Started => "started",
+            watchcat::models::MessageDelivery::Steered => "steered",
+        };
+        println!(
+            "Sent message to {}:{}; {action} turn {}",
+            receipt.provider, receipt.session_id, receipt.turn_id
+        );
+        Ok(())
+    }
+}
+
+fn message_input(argument: Option<String>) -> Result<String> {
+    let message = match argument {
+        Some(message) => message,
+        None if io::stdin().is_terminal() => {
+            bail!("message is required as an argument or via standard input")
+        }
+        None => {
+            let mut message = String::new();
+            io::stdin()
+                .read_to_string(&mut message)
+                .context("cannot read message from standard input")?;
+            message
+        }
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        bail!("message cannot be empty");
+    }
+    Ok(message.to_owned())
 }
 
 async fn watch_command(

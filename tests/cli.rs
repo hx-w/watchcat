@@ -59,6 +59,24 @@ fn exposes_only_the_new_top_level_command_shape() {
 }
 
 #[test]
+fn session_send_is_grouped_and_rejects_empty_stdin() {
+    cargo_bin_cmd!("watchcat")
+        .args(["session", "send", "session-1"])
+        .write_stdin("  \n")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("message cannot be empty"));
+
+    cargo_bin_cmd!("watchcat")
+        .args(["session", "send", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("standard input"))
+        .stdout(predicate::str::contains("--provider"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
 fn initializes_valid_configuration_and_reports_native_paths() {
     let isolated = Isolated::new();
     isolated

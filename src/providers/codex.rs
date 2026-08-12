@@ -10,7 +10,9 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::config::CodexSettings;
-use crate::models::{Failure, ResumeReceipt, Session, SessionLog, SessionState};
+use crate::models::{
+    Failure, MessageDelivery, MessageReceipt, ResumeReceipt, Session, SessionLog, SessionState,
+};
 use crate::providers::Provider;
 use crate::transport::jsonrpc::{JsonRpcClient, JsonRpcError};
 
@@ -292,13 +294,7 @@ impl Provider for CodexProvider {
             .await?;
         let result = self
             .client
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": session_id,
-                    "input": [{"type": "text", "text": prompt}],
-                }),
-            )
+            .request("turn/start", codex_message_params(session_id, prompt))
             .await?;
         let turn_id = result
             .pointer("/turn/id")
@@ -308,6 +304,30 @@ impl Provider for CodexProvider {
             provider: "codex".into(),
             session_id: session_id.into(),
             turn_id: turn_id.into(),
+        })
+    }
+
+    async fn send_message(&mut self, session_id: &str, message: &str) -> Result<MessageReceipt> {
+        self.require_started()?;
+        let resumed = self
+            .client
+            .request("thread/resume", json!({"threadId": session_id}))
+            .await?;
+        let (method, params, delivery) = codex_message_request(&resumed, session_id, message);
+        let result = self.client.request(method, params).await?;
+        let turn_id = result
+            .pointer(if delivery == MessageDelivery::Steered {
+                "/turnId"
+            } else {
+                "/turn/id"
+            })
+            .and_then(Value::as_str)
+            .with_context(|| format!("Codex accepted {method} without returning a turn id"))?;
+        Ok(MessageReceipt {
+            provider: "codex".into(),
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            delivery,
         })
     }
 
@@ -353,6 +373,46 @@ impl Provider for CodexProvider {
                 return Ok(changed);
             }
         }
+    }
+}
+
+fn codex_message_params(session_id: &str, message: &str) -> Value {
+    json!({
+        "threadId": session_id,
+        "input": [{"type": "text", "text": message}],
+    })
+}
+
+fn codex_steer_params(session_id: &str, turn_id: &str, message: &str) -> Value {
+    json!({
+        "threadId": session_id,
+        "expectedTurnId": turn_id,
+        "input": [{"type": "text", "text": message}],
+    })
+}
+
+fn codex_message_request(
+    resumed: &Value,
+    session_id: &str,
+    message: &str,
+) -> (&'static str, Value, MessageDelivery) {
+    let active_turn = resumed
+        .pointer("/thread/turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.last())
+        .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+        .and_then(|turn| turn.get("id").and_then(Value::as_str));
+    match active_turn {
+        Some(turn_id) => (
+            "turn/steer",
+            codex_steer_params(session_id, turn_id, message),
+            MessageDelivery::Steered,
+        ),
+        None => (
+            "turn/start",
+            codex_message_params(session_id, message),
+            MessageDelivery::Started,
+        ),
     }
 }
 
@@ -631,6 +691,41 @@ fn is_unsupported_method(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_params_preserve_multiline_text() {
+        let params = codex_message_params("session-1", "line one\nline two");
+        assert_eq!(params["threadId"], "session-1");
+        assert_eq!(params["input"][0]["type"], "text");
+        assert_eq!(params["input"][0]["text"], "line one\nline two");
+    }
+
+    #[test]
+    fn steer_params_pin_the_active_turn() {
+        let params = codex_steer_params("session-1", "turn-1", "change direction");
+        assert_eq!(params["threadId"], "session-1");
+        assert_eq!(params["expectedTurnId"], "turn-1");
+        assert_eq!(params["input"][0]["text"], "change direction");
+    }
+
+    #[test]
+    fn active_turn_is_steered_and_idle_thread_starts_a_turn() {
+        let active = json!({
+            "thread": {"turns": [{"id": "turn-1", "status": "inProgress"}]}
+        });
+        let (method, params, delivery) = codex_message_request(&active, "session-1", "guide");
+        assert_eq!(method, "turn/steer");
+        assert_eq!(params["expectedTurnId"], "turn-1");
+        assert_eq!(delivery, MessageDelivery::Steered);
+
+        let idle = json!({
+            "thread": {"turns": [{"id": "turn-1", "status": "completed"}]}
+        });
+        let (method, params, delivery) = codex_message_request(&idle, "session-1", "next");
+        assert_eq!(method, "turn/start");
+        assert!(params.get("expectedTurnId").is_none());
+        assert_eq!(delivery, MessageDelivery::Started);
+    }
 
     #[test]
     fn classifies_structured_network_failures() {

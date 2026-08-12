@@ -4,6 +4,14 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-12
+
+### Added
+
+- `watchcat session send` for steering an active turn or starting a new turn
+  with a message from an argument or standard input and structured receipt
+  output.
+
 ## [0.2.0] - 2026-08-12
 
 ### Added

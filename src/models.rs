@@ -68,11 +68,28 @@ impl Failure {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDelivery {
+    #[default]
+    Started,
+    Steered,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResumeReceipt {
     pub provider: String,
     pub session_id: String,
     pub turn_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MessageReceipt {
+    pub provider: String,
+    pub session_id: String,
+    pub turn_id: String,
+    #[serde(default)]
+    pub delivery: MessageDelivery,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

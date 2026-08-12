@@ -40,11 +40,11 @@ Install a specific version or destination when reproducibility matters:
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.sh \
-  | WATCHCAT_VERSION=v0.2.0 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
+  | WATCHCAT_VERSION=v0.2.1 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
 ```
 
 ```powershell
-$env:WATCHCAT_VERSION = "v0.2.0"
+$env:WATCHCAT_VERSION = "v0.2.1"
 $env:WATCHCAT_INSTALL_DIR = "$HOME\bin"
 irm https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.ps1 | iex
 ```
@@ -64,6 +64,9 @@ machine. It needs no separate OpenAI API key.
 watchcat doctor
 watchcat session list
 watchcat watch add SESSION_ID --label "release task"
+
+# Send an explicit instruction without adding the session to the watchlist.
+watchcat session send SESSION_ID "Continue with the release checklist."
 
 # Inspect the effective policy and exercise it without sending a prompt.
 watchcat policy list --category capacity
@@ -134,6 +137,25 @@ watchcat session logs SESSION_ID --json
 Provider messages are read on demand. Watchcat stores only its bounded JSONL
 event history, which may contain provider failure text and retry prompts.
 
+## Send a session message
+
+Send a one-off instruction directly to a session. An active turn is steered;
+an idle session starts a new turn. This is an explicit user action, so the
+session does not need to be in the automatic recovery watchlist and recovery
+policies do not limit it.
+
+```bash
+watchcat session send SESSION_ID "Review the current diff and fix the test."
+printf '%s\n' 'Read the release checklist.' 'Then continue.' \
+  | watchcat session send SESSION_ID
+watchcat session send SESSION_ID "Report status" --json
+```
+
+Watchcat asks the provider to resume and validate the session before delivery.
+An empty argument or empty standard input is rejected. `--provider codex` is
+the current default; the command is provider-neutral so future adapters can
+expose the same contract.
+
 ## Commands
 
 | Command | Purpose |
@@ -144,6 +166,7 @@ event history, which may contain provider failure text and retry prompts.
 | `watchcat session list` | List recent provider sessions |
 | `watchcat session show ID` | Show one provider session |
 | `watchcat session logs ID` | Show structured provider and retry history |
+| `watchcat session send ID MESSAGE` | Steer an active turn or start a new one |
 | `watchcat watch list` | List explicitly watched sessions |
 | `watchcat watch add ID` | Add one session to the watchlist |
 | `watchcat watch remove ID` | Remove one session from the watchlist |
