@@ -40,11 +40,11 @@ Install a specific version or destination when reproducibility matters:
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.sh \
-  | WATCHCAT_VERSION=v0.3.0 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
+  | WATCHCAT_VERSION=v0.3.1 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
 ```
 
 ```powershell
-$env:WATCHCAT_VERSION = "v0.3.0"
+$env:WATCHCAT_VERSION = "v0.3.1"
 $env:WATCHCAT_INSTALL_DIR = "$HOME\bin"
 irm https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.ps1 | iex
 ```

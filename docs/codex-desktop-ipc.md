@@ -31,9 +31,12 @@ authentication material.
 ## Delivery rules
 
 `watchcat session send` first attempts to steer. If the owner reports that the
-session is idle, it starts a turn. If a turn becomes active in that small race
-window, Watchcat makes one final steer attempt. This bounds delivery to one
-logical message without an unbounded race loop.
+session is idle or the active turn ends while the steer is being processed, it
+starts a turn. If a turn becomes active in that small race window, Watchcat
+makes one final steer attempt. Every attempt reuses one client message ID. This
+bounds the state-race sequence to at most three transport requests under one
+logical message identity. Other Desktop errors are returned without an
+automatic retry because their delivery state may be unknown.
 
 The unattended recovery engine is stricter: it only starts a new turn. If one
 is already active, recovery reports an error and leaves that work unchanged.

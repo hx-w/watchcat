@@ -4,6 +4,15 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-12
+
+### Fixed
+
+- Treat a Codex Desktop turn that ends during `session send` as an idle-session
+  race and start a new turn instead of returning an error.
+- Reuse one client message ID across the bounded steer/start retry sequence so
+  Codex can correlate every attempt with the same logical message.
+
 ## [0.3.0] - 2026-08-12
 
 ### Added

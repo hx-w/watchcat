@@ -40,6 +40,12 @@ pub struct DesktopIpcRemoteError {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnStateConflict {
+    Inactive,
+    Active,
+}
+
 pub struct CodexDesktopIpc {
     stream: Box<dyn AsyncStream>,
     client_id: String,
@@ -82,16 +88,27 @@ impl CodexDesktopIpc {
         let Some(owner) = self.discover_owner(session_id).await? else {
             return Ok(None);
         };
+        let message_id = Uuid::new_v4().to_string();
 
-        match self.steer(&owner, session_id, message, cwd).await {
+        match self
+            .steer(&owner, session_id, &message_id, message, cwd)
+            .await
+        {
             Ok(receipt) => Ok(Some(receipt)),
-            Err(error) if is_idle_turn_error(&error) => {
-                match self.start_turn(&owner, session_id, message).await {
+            Err(error) if turn_state_conflict(&error) == Some(TurnStateConflict::Inactive) => {
+                match self
+                    .start_turn(&owner, session_id, &message_id, message)
+                    .await
+                {
                     Ok(receipt) => Ok(Some(receipt)),
                     // The state can change between steer and start. One
                     // bounded reverse attempt avoids duplicate turns.
-                    Err(error) if is_active_turn_error(&error) => {
-                        self.steer(&owner, session_id, message, cwd).await.map(Some)
+                    Err(error)
+                        if turn_state_conflict(&error) == Some(TurnStateConflict::Active) =>
+                    {
+                        self.steer(&owner, session_id, &message_id, message, cwd)
+                            .await
+                            .map(Some)
                     }
                     Err(error) => Err(error),
                 }
@@ -110,7 +127,8 @@ impl CodexDesktopIpc {
         let Some(owner) = self.discover_owner(session_id).await? else {
             return Ok(None);
         };
-        self.start_turn(&owner, session_id, message)
+        let message_id = Uuid::new_v4().to_string();
+        self.start_turn(&owner, session_id, &message_id, message)
             .await
             .map(|receipt| Some(receipt.turn_id))
     }
@@ -182,10 +200,10 @@ impl CodexDesktopIpc {
         &mut self,
         owner: &str,
         session_id: &str,
+        message_id: &str,
         message: &str,
         cwd: &str,
     ) -> Result<DesktopMessageReceipt> {
-        let message_id = Uuid::new_v4().to_string();
         let input = text_input(message);
         let response = self
             .request(
@@ -198,7 +216,7 @@ impl CodexDesktopIpc {
                     "serviceTier": null,
                     "attachments": [],
                     "additionalContext": {},
-                    "restoreMessage": restore_message(&message_id, message, cwd),
+                    "restoreMessage": restore_message(message_id, message, cwd),
                 }),
                 Some(owner),
             )
@@ -219,6 +237,7 @@ impl CodexDesktopIpc {
         &mut self,
         owner: &str,
         session_id: &str,
+        message_id: &str,
         message: &str,
     ) -> Result<DesktopMessageReceipt> {
         let response = self
@@ -228,7 +247,7 @@ impl CodexDesktopIpc {
                 json!({
                     "conversationId": session_id,
                     "turnStartParams": {
-                        "clientUserMessageId": Uuid::new_v4().to_string(),
+                        "clientUserMessageId": message_id,
                         "input": text_input(message),
                         "attachments": [],
                         "useAppServerPermissionDefault": true,
@@ -373,30 +392,29 @@ fn remote_error_message(error: &anyhow::Error) -> Option<&str> {
         .map(|error| error.message.as_str())
 }
 
-fn is_idle_turn_error(error: &anyhow::Error) -> bool {
-    let Some(message) = remote_error_message(error) else {
-        return false;
-    };
+fn turn_state_conflict(error: &anyhow::Error) -> Option<TurnStateConflict> {
+    let message = remote_error_message(error)?;
     let message = message.to_ascii_lowercase();
-    [
+    if [
         "no active turn",
         "without an active turn",
         "not being streamed",
         "not currently active",
         "is not active",
+        "active turn already ended",
     ]
     .iter()
     .any(|needle| message.contains(needle))
-}
-
-fn is_active_turn_error(error: &anyhow::Error) -> bool {
-    let Some(message) = remote_error_message(error) else {
-        return false;
-    };
-    let message = message.to_ascii_lowercase();
-    ["active turn", "already active", "already in progress"]
+    {
+        return Some(TurnStateConflict::Inactive);
+    }
+    if ["active turn", "already active", "already in progress"]
         .iter()
         .any(|needle| message.contains(needle))
+    {
+        return Some(TurnStateConflict::Active);
+    }
+    None
 }
 
 async fn write_frame(stream: &mut (impl AsyncWrite + Unpin), message: &Value) -> Result<()> {
@@ -818,9 +836,18 @@ mod tests {
             initialize_router(&mut router).await;
             discover_owner(&mut router).await;
             let steer = read_request(&mut router, "thread-follower-steer-turn").await;
+            let message_id = steer["params"]["clientUserMessageId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(steer["params"]["restoreMessage"]["id"], message_id);
             respond_error(&mut router, &steer, "no active turn to steer").await;
             let start = read_request(&mut router, "thread-follower-start-turn").await;
             assert_eq!(start["targetClientId"], "desktop-owner");
+            assert_eq!(
+                start["params"]["turnStartParams"]["clientUserMessageId"],
+                message_id
+            );
             assert_eq!(
                 start["params"]["turnStartParams"]["input"][0]["text"],
                 "hello"
@@ -846,6 +873,121 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.turn_id, "turn-started");
         assert_eq!(receipt.delivery, DesktopMessageDelivery::Started);
+        router_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ended_turn_race_starts_a_new_turn_with_the_same_message_id() {
+        let (client_stream, mut router) = tokio::io::duplex(64 * 1024);
+        let router_task = tokio::spawn(async move {
+            initialize_router(&mut router).await;
+            discover_owner(&mut router).await;
+            let steer = read_request(&mut router, "thread-follower-steer-turn").await;
+            let message_id = steer["params"]["clientUserMessageId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            respond_error(
+                &mut router,
+                &steer,
+                "Cannot steer conversation session-1 because its active turn already ended",
+            )
+            .await;
+
+            let start = read_request(&mut router, "thread-follower-start-turn").await;
+            assert_eq!(
+                start["params"]["turnStartParams"]["clientUserMessageId"],
+                message_id
+            );
+            respond_success(
+                &mut router,
+                &start,
+                json!({
+                    "method": "thread-follower-start-turn",
+                    "result": {"turn": {"id": "turn-after-race"}},
+                }),
+            )
+            .await;
+        });
+
+        let mut client = CodexDesktopIpc::connect_test(client_stream, TEST_TIMEOUT)
+            .await
+            .unwrap();
+        let receipt = client
+            .send_message("session-1", "hello", "/workspace")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.turn_id, "turn-after-race");
+        assert_eq!(receipt.delivery, DesktopMessageDelivery::Started);
+        router_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_to_active_race_resteers_with_the_same_message_id() {
+        let (client_stream, mut router) = tokio::io::duplex(64 * 1024);
+        let router_task = tokio::spawn(async move {
+            initialize_router(&mut router).await;
+            discover_owner(&mut router).await;
+            let first_steer = read_request(&mut router, "thread-follower-steer-turn").await;
+            let message_id = first_steer["params"]["clientUserMessageId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            respond_error(&mut router, &first_steer, "no active turn to steer").await;
+
+            let start = read_request(&mut router, "thread-follower-start-turn").await;
+            assert_eq!(
+                start["params"]["turnStartParams"]["clientUserMessageId"],
+                message_id
+            );
+            respond_error(&mut router, &start, "thread already has an active turn").await;
+
+            let second_steer = read_request(&mut router, "thread-follower-steer-turn").await;
+            assert_eq!(second_steer["params"]["clientUserMessageId"], message_id);
+            assert_eq!(second_steer["params"]["restoreMessage"]["id"], message_id);
+            respond_success(
+                &mut router,
+                &second_steer,
+                json!({
+                    "method": "thread-follower-steer-turn",
+                    "result": {"turnId": "turn-after-reverse-race"},
+                }),
+            )
+            .await;
+        });
+
+        let mut client = CodexDesktopIpc::connect_test(client_stream, TEST_TIMEOUT)
+            .await
+            .unwrap();
+        let receipt = client
+            .send_message("session-1", "hello", "/workspace")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.turn_id, "turn-after-reverse-race");
+        assert_eq!(receipt.delivery, DesktopMessageDelivery::Steered);
+        router_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unrelated_steer_error_is_not_retried() {
+        let (client_stream, mut router) = tokio::io::duplex(64 * 1024);
+        let router_task = tokio::spawn(async move {
+            initialize_router(&mut router).await;
+            discover_owner(&mut router).await;
+            let steer = read_request(&mut router, "thread-follower-steer-turn").await;
+            respond_error(&mut router, &steer, "permission denied").await;
+        });
+
+        let mut client = CodexDesktopIpc::connect_test(client_stream, TEST_TIMEOUT)
+            .await
+            .unwrap();
+        let error = client
+            .send_message("session-1", "hello", "/workspace")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission denied"));
         router_task.await.unwrap();
     }
 

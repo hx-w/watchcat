@@ -45,7 +45,7 @@ jobs:
           sudo apt-get install --yes shellcheck
           shellcheck scripts/install.sh
           bash -n scripts/install.sh
-          scripts/install.sh --version v0.3.0 --dry-run
+          scripts/install.sh --version v0.3.1 --dry-run
 
   package:
     name: Package crate
