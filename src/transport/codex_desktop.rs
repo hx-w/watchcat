@@ -630,7 +630,7 @@ mod windows_identity {
         Ok(buffer)
     }
 
-    fn user_sid(buffer: &[usize]) -> Result<*const c_void> {
+    fn user_sid(buffer: &[usize]) -> Result<*mut c_void> {
         if size_of_val(buffer) < size_of::<TOKEN_USER>() {
             bail!("Desktop IPC process token returned truncated user information");
         }
@@ -638,7 +638,7 @@ mod windows_identity {
         // TOKEN_USER, and GetTokenInformation initialized the structure.
         let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
         NonNull::new(user.User.Sid)
-            .map(|sid| sid.as_ptr().cast_const())
+            .map(NonNull::as_ptr)
             .context("Desktop IPC process token returned a null user SID")
     }
 }
