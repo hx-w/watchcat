@@ -4,6 +4,29 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-12
+
+### Added
+
+- Codex Desktop IPC transport for messaging sessions already owned by the
+  Desktop app without acquiring a competing App Server writer.
+- `watchcat session interrupt` for explicitly stopping the exact active turn.
+- Desktop IPC diagnostics and transport fields in structured receipts.
+
+### Changed
+
+- Manual `session send` now steers through the Desktop owner when available and
+  starts a new turn when idle, with one bounded race retry.
+- Automatic recovery may start a new turn through Desktop but never steers an
+  active turn.
+
+### Security
+
+- Unix Desktop IPC endpoints are accepted only when their directory and socket
+  are owned by the current user and the directory is not group/world writable.
+- Private protocol version mismatches fail closed instead of silently falling
+  back.
+
 ## [0.2.1] - 2026-08-12
 
 ### Added

@@ -11,9 +11,11 @@ use uuid::Uuid;
 
 use crate::config::CodexSettings;
 use crate::models::{
-    Failure, MessageDelivery, MessageReceipt, ResumeReceipt, Session, SessionLog, SessionState,
+    Failure, InterruptReceipt, MessageDelivery, MessageReceipt, MessageTransport, ResumeReceipt,
+    Session, SessionLog, SessionState,
 };
 use crate::providers::Provider;
+use crate::transport::codex_desktop::{CodexDesktopIpc, DesktopMessageDelivery};
 use crate::transport::jsonrpc::{JsonRpcClient, JsonRpcError};
 
 const SOURCE_KINDS: &[&str] = &[
@@ -289,6 +291,16 @@ impl Provider for CodexProvider {
 
     async fn resume(&mut self, session_id: &str, prompt: &str) -> Result<ResumeReceipt> {
         self.require_started()?;
+        if let Some(mut desktop) = CodexDesktopIpc::connect_default().await? {
+            if let Some(turn_id) = desktop.start_recovery(session_id, prompt).await? {
+                return Ok(ResumeReceipt {
+                    provider: "codex".into(),
+                    session_id: session_id.into(),
+                    turn_id,
+                    transport: MessageTransport::DesktopIpc,
+                });
+            }
+        }
         self.client
             .request("thread/resume", json!({"threadId": session_id}))
             .await?;
@@ -304,11 +316,27 @@ impl Provider for CodexProvider {
             provider: "codex".into(),
             session_id: session_id.into(),
             turn_id: turn_id.into(),
+            transport: MessageTransport::AppServer,
         })
     }
 
     async fn send_message(&mut self, session_id: &str, message: &str) -> Result<MessageReceipt> {
         self.require_started()?;
+        if let Some(mut desktop) = CodexDesktopIpc::connect_default().await? {
+            let cwd = self.session_cwd(session_id).await;
+            if let Some(receipt) = desktop.send_message(session_id, message, &cwd).await? {
+                return Ok(MessageReceipt {
+                    provider: "codex".into(),
+                    session_id: session_id.into(),
+                    turn_id: receipt.turn_id,
+                    delivery: match receipt.delivery {
+                        DesktopMessageDelivery::Started => MessageDelivery::Started,
+                        DesktopMessageDelivery::Steered => MessageDelivery::Steered,
+                    },
+                    transport: MessageTransport::DesktopIpc,
+                });
+            }
+        }
         let resumed = self
             .client
             .request("thread/resume", json!({"threadId": session_id}))
@@ -328,6 +356,40 @@ impl Provider for CodexProvider {
             session_id: session_id.into(),
             turn_id: turn_id.into(),
             delivery,
+            transport: MessageTransport::AppServer,
+        })
+    }
+
+    async fn interrupt(&mut self, session_id: &str) -> Result<InterruptReceipt> {
+        self.require_started()?;
+        let turn_id = self
+            .active_turn_id(session_id)
+            .await?
+            .with_context(|| format!("Codex session {session_id} has no active turn"))?;
+        if let Some(mut desktop) = CodexDesktopIpc::connect_default().await? {
+            if let Some(interrupted) = desktop.interrupt(session_id, &turn_id).await? {
+                return Ok(InterruptReceipt {
+                    provider: "codex".into(),
+                    session_id: session_id.into(),
+                    turn_id: interrupted,
+                    transport: MessageTransport::DesktopIpc,
+                });
+            }
+        }
+        self.client
+            .request("thread/resume", json!({"threadId": session_id}))
+            .await?;
+        self.client
+            .request(
+                "turn/interrupt",
+                json!({"threadId": session_id, "turnId": turn_id}),
+            )
+            .await?;
+        Ok(InterruptReceipt {
+            provider: "codex".into(),
+            session_id: session_id.into(),
+            turn_id,
+            transport: MessageTransport::AppServer,
         })
     }
 
@@ -374,6 +436,77 @@ impl Provider for CodexProvider {
             }
         }
     }
+}
+
+impl CodexProvider {
+    async fn session_cwd(&self, session_id: &str) -> String {
+        match self
+            .client
+            .request(
+                "thread/read",
+                json!({"threadId": session_id, "includeTurns": false}),
+            )
+            .await
+        {
+            Ok(thread) => thread
+                .pointer("/thread/cwd")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(current_directory),
+            Err(error) => {
+                debug!(%error, %session_id, "cannot read session cwd for Desktop steer");
+                current_directory()
+            }
+        }
+    }
+
+    async fn active_turn_id(&self, session_id: &str) -> Result<Option<String>> {
+        let result = match self
+            .client
+            .request(
+                "thread/turns/list",
+                json!({
+                    "threadId": session_id,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "notLoaded",
+                }),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if is_unsupported_method(&error) => {
+                self.client
+                    .request(
+                        "thread/read",
+                        json!({"threadId": session_id, "includeTurns": true}),
+                    )
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+        let turn = result
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|turns| turns.first())
+            .or_else(|| {
+                result
+                    .pointer("/thread/turns")
+                    .and_then(Value::as_array)
+                    .and_then(|turns| turns.last())
+            });
+        Ok(turn
+            .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+            .and_then(|turn| turn.get("id").and_then(Value::as_str))
+            .map(str::to_owned))
+    }
+}
+
+fn current_directory() -> String {
+    std::env::current_dir()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".into())
 }
 
 fn codex_message_params(session_id: &str, message: &str) -> Value {

@@ -9,6 +9,6 @@ pub mod state;
 pub mod transport;
 
 pub use models::{
-    BackoffKind, Failure, MessageDelivery, MessageReceipt, PolicyAction, ResumeReceipt, Session,
-    SessionLog, SessionState, WatchTarget,
+    BackoffKind, Failure, InterruptReceipt, MessageDelivery, MessageReceipt, MessageTransport,
+    PolicyAction, ResumeReceipt, Session, SessionLog, SessionState, WatchTarget,
 };

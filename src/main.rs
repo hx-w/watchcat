@@ -13,9 +13,10 @@ use watchcat::config::{
     Paths, Settings, display_settings, initialize_config, load_settings, save_settings,
 };
 use watchcat::engine::WatchEngine;
-use watchcat::models::{BackoffKind, PolicyAction, SessionLog, WatchTarget};
+use watchcat::models::{BackoffKind, MessageTransport, PolicyAction, SessionLog, WatchTarget};
 use watchcat::providers::{CodexProvider, Provider};
 use watchcat::state::{EventLogStore, ProcessLock, RuntimeState, WatchlistStore};
+use watchcat::transport::codex_desktop::CodexDesktopIpc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -74,6 +75,8 @@ enum SessionCommand {
     Logs(SessionLogsArgs),
     /// Send a message by steering an active turn or starting a new turn.
     Send(SessionSendArgs),
+    /// Interrupt the active turn in a provider session.
+    Interrupt(SessionIdArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,6 +309,7 @@ async fn session_command(
         }
         SessionCommand::Logs(args) => session_logs(settings, paths, args).await,
         SessionCommand::Send(args) => send_session_message(settings, args).await,
+        SessionCommand::Interrupt(args) => interrupt_session(settings, args).await,
     }
 }
 
@@ -337,10 +341,52 @@ async fn send_session_message(settings: &Settings, args: SessionSendArgs) -> Res
             watchcat::models::MessageDelivery::Steered => "steered",
         };
         println!(
-            "Sent message to {}:{}; {action} turn {}",
-            receipt.provider, receipt.session_id, receipt.turn_id
+            "Sent message to {}:{}; {action} turn {} via {}",
+            receipt.provider,
+            receipt.session_id,
+            receipt.turn_id,
+            transport_name(receipt.transport)
         );
         Ok(())
+    }
+}
+
+async fn interrupt_session(settings: &Settings, args: SessionIdArgs) -> Result<()> {
+    let mut providers = started_provider(settings, &args.provider).await?;
+    let result = async {
+        providers
+            .get_mut(&args.provider)
+            .context("provider was not constructed")?
+            .interrupt(&args.session_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot interrupt {} session {}",
+                    args.provider, args.session_id
+                )
+            })
+    }
+    .await;
+    close_providers(&mut providers).await;
+    let receipt = result?;
+    if args.json {
+        emit_serializable(&receipt, true)
+    } else {
+        println!(
+            "Interrupted {}:{} turn {} via {}",
+            receipt.provider,
+            receipt.session_id,
+            receipt.turn_id,
+            transport_name(receipt.transport)
+        );
+        Ok(())
+    }
+}
+
+fn transport_name(transport: MessageTransport) -> &'static str {
+    match transport {
+        MessageTransport::AppServer => "app_server",
+        MessageTransport::DesktopIpc => "desktop_ipc",
     }
 }
 
@@ -793,6 +839,23 @@ async fn doctor(settings: &Settings, paths: &Paths, json_output: bool) -> Result
             Ok(count) => checks.push(json!({"name": "Codex App Server", "ok": true, "detail": format!("connected; {count} session(s) sampled")})),
             Err(error) => checks.push(json!({"name": "Codex App Server", "ok": false, "detail": error.to_string()})),
         }
+    }
+    match CodexDesktopIpc::probe().await {
+        Ok(true) => checks.push(json!({
+            "name": "Codex Desktop IPC",
+            "ok": true,
+            "detail": "connected; Desktop-owned sessions can be controlled",
+        })),
+        Ok(false) => checks.push(json!({
+            "name": "Codex Desktop IPC",
+            "ok": true,
+            "detail": "not running; optional App Server fallback remains available",
+        })),
+        Err(error) => checks.push(json!({
+            "name": "Codex Desktop IPC",
+            "ok": false,
+            "detail": error.to_string(),
+        })),
     }
     checks.push(json!({"name": "configuration", "ok": true, "detail": paths.config_file}));
     checks.push(json!({"name": "event log", "ok": true, "detail": paths.event_log_file}));

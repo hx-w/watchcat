@@ -40,11 +40,11 @@ Install a specific version or destination when reproducibility matters:
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.sh \
-  | WATCHCAT_VERSION=v0.2.1 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
+  | WATCHCAT_VERSION=v0.3.0 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
 ```
 
 ```powershell
-$env:WATCHCAT_VERSION = "v0.2.1"
+$env:WATCHCAT_VERSION = "v0.3.0"
 $env:WATCHCAT_INSTALL_DIR = "$HOME\bin"
 irm https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.ps1 | iex
 ```
@@ -67,6 +67,9 @@ watchcat watch add SESSION_ID --label "release task"
 
 # Send an explicit instruction without adding the session to the watchlist.
 watchcat session send SESSION_ID "Continue with the release checklist."
+
+# Stop the session's active turn explicitly.
+watchcat session interrupt SESSION_ID
 
 # Inspect the effective policy and exercise it without sending a prompt.
 watchcat policy list --category capacity
@@ -137,24 +140,36 @@ watchcat session logs SESSION_ID --json
 Provider messages are read on demand. Watchcat stores only its bounded JSONL
 event history, which may contain provider failure text and retry prompts.
 
-## Send a session message
+## Control a session
 
-Send a one-off instruction directly to a session. An active turn is steered;
-an idle session starts a new turn. This is an explicit user action, so the
-session does not need to be in the automatic recovery watchlist and recovery
-policies do not limit it.
+Send a one-off instruction directly to a session. For sessions owned by Codex
+Desktop, Watchcat asks the owning window to steer its active turn or start a new
+one through the local Desktop IPC router. This avoids competing for the App
+Server's single-writer lock. If Desktop is not running or does not own the
+session, Watchcat falls back to a standalone Codex App Server connection.
+
+These are explicit user actions, so the session does not need to be in the
+automatic recovery watchlist and recovery policies do not limit them.
 
 ```bash
 watchcat session send SESSION_ID "Review the current diff and fix the test."
 printf '%s\n' 'Read the release checklist.' 'Then continue.' \
   | watchcat session send SESSION_ID
 watchcat session send SESSION_ID "Report status" --json
+watchcat session interrupt SESSION_ID
+watchcat session interrupt SESSION_ID --json
 ```
 
-Watchcat asks the provider to resume and validate the session before delivery.
-An empty argument or empty standard input is rejected. `--provider codex` is
-the current default; the command is provider-neutral so future adapters can
-expose the same contract.
+`session interrupt` requires an active turn and targets its exact turn ID. An
+empty message argument or empty standard input is rejected. `--provider codex`
+is the current default; both commands are provider-neutral so future adapters
+can expose the same contract.
+
+Codex Desktop IPC is a private, versioned local protocol rather than a public
+OpenAI API. Watchcat validates protocol versions and endpoint ownership and
+fails closed when compatibility is unknown. Run `watchcat doctor` after a Codex
+Desktop update. See [Codex Desktop IPC](docs/codex-desktop-ipc.md) for the
+compatibility and fallback contract.
 
 ## Commands
 
@@ -167,6 +182,7 @@ expose the same contract.
 | `watchcat session show ID` | Show one provider session |
 | `watchcat session logs ID` | Show structured provider and retry history |
 | `watchcat session send ID MESSAGE` | Steer an active turn or start a new one |
+| `watchcat session interrupt ID` | Stop the exact active turn |
 | `watchcat watch list` | List explicitly watched sessions |
 | `watchcat watch add ID` | Add one session to the watchlist |
 | `watchcat watch remove ID` | Remove one session from the watchlist |
@@ -191,6 +207,7 @@ The engine enforces these invariants:
 - Every retry is delayed and bounded.
 - The failed turn is read again immediately before sending a prompt.
 - A changed session cancels the pending continuation.
+- Automatic recovery only starts a new turn; it never steers active work.
 - Unknown failures skip by default.
 - Dry-run mode never sends or marks a failure handled.
 - One state directory can have only one active runner.
@@ -199,12 +216,14 @@ The engine enforces these invariants:
 `WATCHCAT_CONFIG_DIR`, `WATCHCAT_STATE_DIR`, and `WATCHCAT_WATCHLIST` override
 local storage.
 
-Version 0.2 uses configuration, watchlist, and runtime-state schema 2. Version 1
-files are intentionally unsupported. Run `watchcat config init --force`, review
-the new configuration, and rebuild the watchlist when upgrading from 0.1.
+Versions 0.2 and 0.3 use configuration, watchlist, and runtime-state schema 2.
+Version 1 files are intentionally unsupported. Run
+`watchcat config init --force`, review the new configuration, and rebuild the
+watchlist when upgrading from 0.1.
 
-Watchcat does not expose a network listener or store provider credentials. Read
-the [Security policy](SECURITY.md) before running it on a shared machine.
+Watchcat does not expose a network listener or store provider credentials. Its
+Desktop integration connects only to the current user's local IPC endpoint.
+Read the [Security policy](SECURITY.md) before running it on a shared machine.
 
 ## Development and releases
 

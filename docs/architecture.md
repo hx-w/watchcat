@@ -16,6 +16,8 @@ WatchEngine -------- WatchlistStore
 Provider contract
     |
     +---- CodexProvider ---- JSON-RPC stdio ---- codex app-server
+    |          |
+    |          +---- framed local IPC ---- Codex Desktop owner
     |
     +---- future session adapters
 
@@ -46,7 +48,9 @@ Each session adapter implements:
 3. `session_logs()` for provider-native turns and messages.
 4. `latest_failure()` for normalized failure detection.
 5. `resume()` for one continuation turn.
-6. `wait_for_change()` as an optional wakeup optimization.
+6. `send_message()` for explicit start-or-steer delivery.
+7. `interrupt()` for explicit active-turn cancellation when supported.
+8. `wait_for_change()` as an optional wakeup optimization.
 
 Claude Code's official `StopFailure` codes are normalized and tested in the
 shared classifier. This release does not include a Claude session adapter or
@@ -59,6 +63,7 @@ claim that it can resume Claude sessions.
 - Retry attempts are delayed and bounded per session and time window.
 - The latest failed turn is read again immediately before `resume()`.
 - A changed session cancels the pending continuation.
+- Automatic recovery never steers an active turn.
 - Dry-run mode never sends a prompt or marks a failure handled.
 - One watchdog process may own a state directory.
 - Provider and Watchcat events are retained as bounded JSONL history.
@@ -67,8 +72,14 @@ claim that it can resume Claude sessions.
 
 The adapter starts `codex app-server --listen stdio://`, initializes the
 JSON-RPC connection, and reads interactive Codex threads. `thread/read` supplies
-structured turns and message items for `session logs`. Recovery uses
-`thread/resume`, followed by `turn/start` with the rendered policy prompt.
+structured turns and message items for `session logs`.
+
+When Codex Desktop owns a thread, a second transport connects to its local IPC
+router and targets the owning Desktop client. Manual messages steer an active
+turn or start an idle turn. Automatic recovery only attempts a new turn; it
+never changes the instructions of already-running work. A missing Desktop owner
+falls back to `thread/resume` plus App Server `turn/start`; an incompatible or
+untrusted Desktop endpoint fails closed.
 
 Filesystem notifications reduce latency. Periodic reconciliation remains the
 correctness fallback for lost events, unsupported watch APIs, and restarts.
@@ -87,5 +98,7 @@ not copy full provider conversations. Provider messages are read on demand.
 
 Watchcat assumes the local account already has authority to use watched agent
 sessions. It exposes no network listener and stores no provider credentials.
+The Codex Desktop transport validates the ownership and permissions of Unix IPC
+endpoints before connecting and uses only a fixed endpoint and fixed methods.
 Anyone who can edit the configuration, watchlist, or state directory should be
 treated as having equivalent local account access.

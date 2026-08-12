@@ -347,7 +347,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::models::{ResumeReceipt, Session, SessionLog};
+    use crate::models::{MessageTransport, ResumeReceipt, Session, SessionLog};
 
     struct FakeProvider {
         failures: VecDeque<Option<Failure>>,
@@ -384,6 +384,7 @@ mod tests {
                 provider: "fake".into(),
                 session_id: session_id.into(),
                 turn_id: "continued".into(),
+                transport: MessageTransport::AppServer,
             })
         }
     }

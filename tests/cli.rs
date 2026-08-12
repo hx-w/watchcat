@@ -77,6 +77,21 @@ fn session_send_is_grouped_and_rejects_empty_stdin() {
 }
 
 #[test]
+fn session_interrupt_is_grouped_with_provider_neutral_options() {
+    cargo_bin_cmd!("watchcat")
+        .args(["session", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("interrupt"));
+    cargo_bin_cmd!("watchcat")
+        .args(["session", "interrupt", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--provider"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
 fn initializes_valid_configuration_and_reports_native_paths() {
     let isolated = Isolated::new();
     isolated

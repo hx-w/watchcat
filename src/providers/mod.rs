@@ -3,10 +3,12 @@ mod codex;
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use crate::models::{Failure, MessageReceipt, ResumeReceipt, Session, SessionLog};
+use crate::models::{
+    Failure, InterruptReceipt, MessageReceipt, ResumeReceipt, Session, SessionLog,
+};
 
 pub use claude::{classify_claude_error, classify_claude_hook};
 pub use codex::{CodexProvider, classify_codex_error};
@@ -21,6 +23,10 @@ pub trait Provider: Send {
     async fn latest_failure(&mut self, session_id: &str) -> Result<Option<Failure>>;
     async fn resume(&mut self, session_id: &str, prompt: &str) -> Result<ResumeReceipt>;
 
+    async fn interrupt(&mut self, _session_id: &str) -> Result<InterruptReceipt> {
+        bail!("{} does not support interrupting sessions", self.name())
+    }
+
     async fn send_message(&mut self, session_id: &str, message: &str) -> Result<MessageReceipt> {
         let receipt = self.resume(session_id, message).await?;
         Ok(MessageReceipt {
@@ -28,6 +34,7 @@ pub trait Provider: Send {
             session_id: receipt.session_id,
             turn_id: receipt.turn_id,
             delivery: crate::models::MessageDelivery::Started,
+            transport: receipt.transport,
         })
     }
 
