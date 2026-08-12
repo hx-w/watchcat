@@ -44,3 +44,7 @@ field requires a migration and a changelog entry.
 3. Merge to `main`, then push the matching `vMAJOR.MINOR.PATCH` tag.
 4. The release workflow builds five native targets, creates SHA-256 checksums,
    publishes a GitHub Release, and tests both installers against that release.
+
+Dependabot groups GitHub Actions updates because the upload and download
+actions form one release-artifact contract. Review major dependency updates
+individually even when their automated checks pass.

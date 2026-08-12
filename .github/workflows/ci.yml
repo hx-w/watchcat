@@ -54,6 +54,24 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo package --locked
 
+  artifact-roundtrip:
+    name: Artifact upload and download
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create probe artifact
+        run: printf 'watchcat-artifact-probe\n' > probe.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watchcat-ci-probe
+          path: probe.txt
+          if-no-files-found: error
+      - uses: actions/download-artifact@v4
+        with:
+          name: watchcat-ci-probe
+          path: downloaded
+      - name: Verify downloaded content
+        run: cmp probe.txt downloaded/probe.txt
+
   msrv:
     name: Rust 1.85 compatibility
     runs-on: ubuntu-latest
