@@ -1,6 +1,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use serde_json::Value;
+use std::path::Path;
 use tempfile::{TempDir, tempdir};
 
 struct Isolated {
@@ -78,18 +79,8 @@ fn initializes_valid_configuration_and_reports_native_paths() {
         .unwrap();
     assert!(output.status.success());
     let paths: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(
-        paths["config"]
-            .as_str()
-            .unwrap()
-            .ends_with("config/config.toml")
-    );
-    assert!(
-        paths["events"]
-            .as_str()
-            .unwrap()
-            .ends_with("state/events.jsonl")
-    );
+    assert!(Path::new(paths["config"].as_str().unwrap()).ends_with("config/config.toml"));
+    assert!(Path::new(paths["events"].as_str().unwrap()).ends_with("state/events.jsonl"));
 }
 
 #[test]

@@ -253,9 +253,10 @@ fn validate_override(condition: &str, policy: &PolicyOverride) -> Result<()> {
         bail!("policy {condition} retry settings must be positive");
     }
     if let (Some(initial), Some(maximum)) = (policy.initial_delay_seconds, policy.max_delay_seconds)
-        && maximum < initial
     {
-        bail!("policy {condition} max_delay_seconds cannot be less than initial_delay_seconds");
+        if maximum < initial {
+            bail!("policy {condition} max_delay_seconds cannot be less than initial_delay_seconds");
+        }
     }
     if policy.action == Some(PolicyAction::Skip)
         && (policy.backoff.is_some()
