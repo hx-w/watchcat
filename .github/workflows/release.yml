@@ -73,7 +73,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/watchcat.exe" $staging
           Copy-Item README.md, LICENSE $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: watchcat-${{ matrix.target }}
           path: watchcat-${{ matrix.target }}.${{ matrix.archive }}
