@@ -1,0 +1,13 @@
+# Copy to ~/.config/watchcat/config.toml or run `watchcat init`.
+version = 1
+
+[engine]
+poll_interval_seconds = 10
+max_attempts = 3
+attempt_window_seconds = 3600
+backoff_seconds = [5, 30, 120]
+resume_prompt = "Continue the previous unfinished task. First inspect the last checkpoint and any changes already persisted to disk. Do not redo completed work."
+
+[providers.codex]
+enabled = true
+command = ["codex", "app-server", "--listen", "stdio://"]

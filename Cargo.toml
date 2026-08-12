@@ -1,0 +1,39 @@
+[package]
+name = "watchcat"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A provider-neutral watchdog that safely resumes interrupted AI coding sessions"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/hx-w/watchcat"
+homepage = "https://github.com/hx-w/watchcat"
+documentation = "https://docs.rs/watchcat"
+keywords = ["codex", "agent", "watchdog", "automation"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/"]
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+directories = "6.0"
+fs2 = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tempfile = "3.20"
+tokio = { version = "1.47", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["v5"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"

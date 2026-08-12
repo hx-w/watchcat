@@ -1,0 +1,23 @@
+name: Provider request
+description: Propose support for another coding agent
+body:
+  - type: input
+    id: provider
+    attributes:
+      label: Provider name
+    validations:
+      required: true
+  - type: textarea
+    id: api
+    attributes:
+      label: Supported integration surface
+      description: Link official session, event, and resume APIs or protocols.
+    validations:
+      required: true
+  - type: textarea
+    id: failures
+    attributes:
+      label: Safe retry classifications
+      description: Explain how network failures differ from user decisions and policy failures.
+    validations:
+      required: true

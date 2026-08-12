@@ -1,0 +1,29 @@
+name: Bug report
+description: Report incorrect Watchcat behavior
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Watchcat version
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options: [Codex, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Redact session content and credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
