@@ -182,7 +182,7 @@ CI runs the test suite on Linux, macOS, and Windows, checks Rust 1.85
 compatibility, lints the shell installer, and verifies crate packaging. A
 matching `vMAJOR.MINOR.PATCH` tag builds five native archives, publishes
 SHA-256 checksums, creates the GitHub Release, and performs real install tests
-on Linux and Windows.
+on Linux, macOS, and Windows.
 
 Read [Contributing](CONTRIBUTING.md) before proposing a provider or changing the
 recovery allowlist. User-visible changes belong in [Changelog](CHANGELOG.md).

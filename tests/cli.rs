@@ -1,5 +1,6 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
+use serde_json::Value;
 use tempfile::tempdir;
 
 fn isolated_command() -> assert_cmd::Command {
@@ -33,18 +34,22 @@ fn initializes_and_reports_native_paths() {
         .assert()
         .success();
 
-    cargo_bin_cmd!("watchcat")
+    let output = cargo_bin_cmd!("watchcat")
         .env("WATCHCAT_CONFIG_DIR", &config)
         .env("WATCHCAT_STATE_DIR", &state)
         .args(["paths", "--json"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            config.join("config.toml").display().to_string(),
-        ))
-        .stdout(predicate::str::contains(
-            state.join("state.json").display().to_string(),
-        ));
+        .output()
+        .expect("run paths command");
+    assert!(output.status.success());
+    let paths: Value = serde_json::from_slice(&output.stdout).expect("parse paths JSON");
+    assert_eq!(
+        paths["config"].as_str().map(std::path::Path::new),
+        Some(config.join("config.toml").as_path())
+    );
+    assert_eq!(
+        paths["state"].as_str().map(std::path::Path::new),
+        Some(state.join("state.json").as_path())
+    );
 }
 
 #[test]
