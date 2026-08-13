@@ -3,34 +3,45 @@ name: Release
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Validate tag and test
         shell: bash
         run: |
           set -euo pipefail
           crate_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          test "v${crate_version}" = "${GITHUB_REF_NAME}"
+          test "v${crate_version}" = "${RELEASE_TAG}"
           cargo test --all-targets --locked
 
   validate-macos-client:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Test client and verify app bundle
         run: |
           swift test --package-path clients/macos
@@ -61,6 +72,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
       - run: rustup default stable
       - run: cargo build --release --locked --bins --target ${{ matrix.target }}
@@ -103,6 +116,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Build ad-hoc signed app preview
         shell: bash
         run: |
@@ -136,10 +151,12 @@ jobs:
           test -f artifacts/Watchcat-macos-aarch64-preview.zip
           test -f artifacts/Watchcat-macos-x86_64-preview.zip
           for archive in artifacts/watchcat-*.tar.gz; do
-            tar -tzf "$archive" | grep -q '/watchcat$'
-            tar -tzf "$archive" | grep -q '/watchcatd$'
+            archive_entries="$(tar -tzf "$archive")"
+            grep -Eq '/watchcat$' <<<"$archive_entries"
+            grep -Eq '/watchcatd$' <<<"$archive_entries"
           done
-          unzip -l artifacts/watchcat-x86_64-pc-windows-msvc.zip | grep -q 'watchcat.exe'
+          windows_entries="$(unzip -Z1 artifacts/watchcat-x86_64-pc-windows-msvc.zip)"
+          grep -Eq '/watchcat.exe$' <<<"$windows_entries"
 
   installers:
     needs: [build, smoke-artifacts]
@@ -149,6 +166,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@v8
         with:
           path: release-files
@@ -182,9 +201,9 @@ jobs:
           fi
           cd ..
           destination="${RUNNER_TEMP}/watchcat-bin"
-          bash scripts/install.sh --version "${GITHUB_REF_NAME}" --to "$destination"
-          test "$("${destination}/watchcat" --version)" = "watchcat ${GITHUB_REF_NAME#v}"
-          test "$("${destination}/watchcatd" --version)" = "watchcatd ${GITHUB_REF_NAME#v}"
+          bash scripts/install.sh --version "${RELEASE_TAG}" --to "$destination"
+          test "$("${destination}/watchcat" --version)" = "watchcat ${RELEASE_TAG#v}"
+          test "$("${destination}/watchcatd" --version)" = "watchcatd ${RELEASE_TAG#v}"
       - name: Smoke test PowerShell installer
         if: runner.os == 'Windows'
         shell: pwsh
@@ -193,9 +212,9 @@ jobs:
         run: |
           Get-ChildItem release-files/watchcat-* | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Set-Content release-files/SHA256SUMS
           $destination = Join-Path $env:RUNNER_TEMP "watchcat-bin"
-          ./scripts/install.ps1 -Version $env:GITHUB_REF_NAME -InstallDir $destination
+          ./scripts/install.ps1 -Version $env:RELEASE_TAG -InstallDir $destination
           $actual = & (Join-Path $destination "watchcat.exe") --version
-          $expected = "watchcat " + $env:GITHUB_REF_NAME.Substring(1)
+          $expected = "watchcat " + $env:RELEASE_TAG.Substring(1)
           if ($actual -ne $expected) { throw "Expected '$expected', got '$actual'" }
 
   publish:
@@ -205,6 +224,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -215,8 +236,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          gh release create "${GITHUB_REF_NAME}"
+          gh release create "${RELEASE_TAG}"
           artifacts/*
           --verify-tag
           --notes-file docs/release-v0.4.0.md
-          --title "Watchcat ${GITHUB_REF_NAME}"
+          --title "Watchcat ${RELEASE_TAG}"
