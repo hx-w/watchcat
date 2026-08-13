@@ -654,17 +654,17 @@ impl WatchcatDaemon {
                     target.provider == update.session.provider
                         && target.session_id == update.session.session_id
                 }) {
-                    if let Some(enabled) = update.enabled
-                        && target.enabled != enabled
-                    {
-                        target.enabled = enabled;
-                        changed = true;
+                    if let Some(enabled) = update.enabled {
+                        if target.enabled != enabled {
+                            target.enabled = enabled;
+                            changed = true;
+                        }
                     }
-                    if let Some(protected) = update.protected
-                        && target.protected != protected
-                    {
-                        target.protected = protected;
-                        changed = true;
+                    if let Some(protected) = update.protected {
+                        if target.protected != protected {
+                            target.protected = protected;
+                            changed = true;
+                        }
                     }
                 }
                 if changed {
