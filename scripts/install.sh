@@ -62,6 +62,19 @@ case "$(uname -m)" in
 esac
 
 target="${architecture}-${platform}"
+
+state_dir="${WATCHCAT_STATE_DIR:-}"
+if [ -z "$state_dir" ]; then
+  case "$platform" in
+    apple-darwin) state_dir="${HOME}/Library/Application Support/ai.watchcat.watchcat" ;;
+    unknown-linux-gnu) state_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/watchcat" ;;
+  esac
+fi
+if [ "$DRY_RUN" -ne 1 ] && [ -S "${state_dir}/watchcat.sock" ]; then
+  echo "Watchcat service is running. Stop it before updating, then rerun the installer." >&2
+  exit 1
+fi
+
 if [ "$VERSION" = "latest" ]; then
   release_url="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${REPOSITORY}/releases/latest")"
   VERSION="${release_url##*/}"
@@ -73,18 +86,47 @@ printf '%s\n' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
 }
 
 archive="watchcat-${target}.tar.gz"
-base_url="https://github.com/${REPOSITORY}/releases/download/${VERSION}"
+base_url="${WATCHCAT_RELEASE_BASE_URL:-https://github.com/${REPOSITORY}/releases/download/${VERSION}}"
+
+fetch() {
+  case "$base_url" in
+    https://*) curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --retry-connrefused -fsSL "$1" -o "$2" ;;
+    http://127.0.0.1:*|http://localhost:*) curl --proto '=http' --retry 3 --retry-delay 1 --retry-connrefused -fsSL "$1" -o "$2" ;;
+    *) echo "release base URL must use HTTPS (localhost HTTP is allowed for tests)" >&2; exit 1 ;;
+  esac
+}
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf 'Would install %s for %s to %s\n' "$VERSION" "$target" "$INSTALL_DIR/watchcat"
+  printf 'Would install %s for %s to %s\n' "$VERSION" "$target" "$INSTALL_DIR"
   exit 0
 fi
 
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/watchcat-install.XXXXXX")"
-trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+restore_install=0
+lock_pid=""
+cleanup() {
+  status=$?
+  if [ -n "$lock_pid" ]; then
+    kill "$lock_pid" 2>/dev/null || true
+    wait "$lock_pid" 2>/dev/null || true
+  fi
+  if [ "$restore_install" -eq 1 ]; then
+    for binary in watchcat watchcatd; do
+      if [ -f "${temporary}/${binary}.backup" ]; then
+        mv "${temporary}/${binary}.backup" "${INSTALL_DIR}/${binary}"
+      else
+        rm -f "${INSTALL_DIR}/${binary}"
+      fi
+    done
+  fi
+  rm -rf "$temporary"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
-curl --proto '=https' --tlsv1.2 -fsSL "${base_url}/${archive}" -o "${temporary}/${archive}"
-curl --proto '=https' --tlsv1.2 -fsSL "${base_url}/SHA256SUMS" -o "${temporary}/SHA256SUMS"
+fetch "${base_url}/${archive}" "${temporary}/${archive}"
+fetch "${base_url}/SHA256SUMS" "${temporary}/SHA256SUMS"
 
 expected="$(awk -v file="$archive" '$2 == file { print $1 }' "${temporary}/SHA256SUMS")"
 [ -n "$expected" ] || { echo "checksum is missing for ${archive}" >&2; exit 1; }
@@ -101,9 +143,46 @@ fi
 tar -xzf "${temporary}/${archive}" -C "$temporary"
 mkdir -p "$INSTALL_DIR"
 install -m 755 "${temporary}/watchcat-${target}/watchcat" "${INSTALL_DIR}/watchcat.tmp"
-mv "${INSTALL_DIR}/watchcat.tmp" "${INSTALL_DIR}/watchcat"
+install -m 755 "${temporary}/watchcat-${target}/watchcatd" "${INSTALL_DIR}/watchcatd.tmp"
 
-printf 'Installed Watchcat %s to %s\n' "$VERSION" "$INSTALL_DIR/watchcat"
+# Hold the same advisory lock as the daemon across the replacement. The
+# socket-only preflight above is user-friendly, while this closes the startup
+# and download TOCTOU windows.
+mkdir -p "$state_dir"
+chmod 700 "$state_dir" 2>/dev/null || true
+lock_ready="${temporary}/update-lock-ready"
+"${temporary}/watchcat-${target}/watchcatd" \
+  --hold-update-lock "$state_dir/watchcat.lock" \
+  --lock-ready "$lock_ready" &
+lock_pid=$!
+attempt=0
+while [ ! -f "$lock_ready" ] && kill -0 "$lock_pid" 2>/dev/null && [ "$attempt" -lt 50 ]; do
+  sleep 0.1
+  attempt=$((attempt + 1))
+done
+if [ ! -f "$lock_ready" ]; then
+  wait "$lock_pid" 2>/dev/null || true
+  lock_pid=""
+  echo "Watchcat service started while the update was downloading. Stop it and rerun the installer." >&2
+  exit 1
+fi
+if [ -S "${state_dir}/watchcat.sock" ]; then
+  echo "Watchcat service is running. Stop it before updating, then rerun the installer." >&2
+  exit 1
+fi
+for binary in watchcat watchcatd; do
+  if [ -f "${INSTALL_DIR}/${binary}" ]; then
+    cp -p "${INSTALL_DIR}/${binary}" "${temporary}/${binary}.backup"
+  fi
+done
+restore_install=1
+mv "${INSTALL_DIR}/watchcat.tmp" "${INSTALL_DIR}/watchcat"
+mv "${INSTALL_DIR}/watchcatd.tmp" "${INSTALL_DIR}/watchcatd"
+test "$("${INSTALL_DIR}/watchcat" --version)" = "watchcat ${VERSION#v}"
+test "$("${INSTALL_DIR}/watchcatd" --version)" = "watchcatd ${VERSION#v}"
+restore_install=0
+
+printf 'Installed Watchcat %s CLI and daemon to %s\n' "$VERSION" "$INSTALL_DIR"
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *) printf 'Add %s to PATH to run watchcat.\n' "$INSTALL_DIR" ;;

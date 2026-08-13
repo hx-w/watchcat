@@ -7,6 +7,8 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+use super::AcknowledgementUnknown;
+
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 #[cfg(unix)]
@@ -123,12 +125,12 @@ impl CodexDesktopIpc {
         &mut self,
         session_id: &str,
         message: &str,
+        idempotency_key: &str,
     ) -> Result<Option<String>> {
         let Some(owner) = self.discover_owner(session_id).await? else {
             return Ok(None);
         };
-        let message_id = Uuid::new_v4().to_string();
-        self.start_turn(&owner, session_id, &message_id, message)
+        self.start_turn(&owner, session_id, idempotency_key, message)
             .await
             .map(|receipt| Some(receipt.turn_id))
     }
@@ -241,7 +243,7 @@ impl CodexDesktopIpc {
         message: &str,
     ) -> Result<DesktopMessageReceipt> {
         let response = self
-            .request(
+            .request_with_unknown_ack(
                 "thread-follower-start-turn",
                 1,
                 json!({
@@ -276,6 +278,29 @@ impl CodexDesktopIpc {
         params: Value,
         target_client_id: Option<&str>,
     ) -> Result<Value> {
+        self.request_inner(method, version, params, target_client_id, false)
+            .await
+    }
+
+    async fn request_with_unknown_ack(
+        &mut self,
+        method: &str,
+        version: u64,
+        params: Value,
+        target_client_id: Option<&str>,
+    ) -> Result<Value> {
+        self.request_inner(method, version, params, target_client_id, true)
+            .await
+    }
+
+    async fn request_inner(
+        &mut self,
+        method: &str,
+        version: u64,
+        params: Value,
+        target_client_id: Option<&str>,
+        side_effect_may_have_started: bool,
+    ) -> Result<Value> {
         let request_id = Uuid::new_v4().to_string();
         let mut message = json!({
             "type": "request",
@@ -291,9 +316,24 @@ impl CodexDesktopIpc {
         }
         write_frame(&mut self.stream, &message).await?;
 
-        let response = tokio::time::timeout(self.timeout, self.read_response(&request_id))
-            .await
-            .with_context(|| format!("Codex Desktop IPC request timed out: {method}"))??;
+        let response =
+            match tokio::time::timeout(self.timeout, self.read_response(&request_id)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) if side_effect_may_have_started => {
+                    return Err(AcknowledgementUnknown(format!(
+                        "Codex Desktop IPC closed while waiting for {method}: {error:#}"
+                    ))
+                    .into());
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) if side_effect_may_have_started => {
+                    return Err(AcknowledgementUnknown(format!(
+                        "Codex Desktop IPC request timed out: {method}"
+                    ))
+                    .into());
+                }
+                Err(_) => bail!("Codex Desktop IPC request timed out: {method}"),
+            };
         if response.get("resultType").and_then(Value::as_str) == Some("error") {
             return Err(DesktopIpcRemoteError {
                 method: method.into(),
@@ -1005,7 +1045,7 @@ mod tests {
             .await
             .unwrap();
         let error = client
-            .start_recovery("session-1", "continue")
+            .start_recovery("session-1", "continue", "failure-key")
             .await
             .unwrap_err();
         assert!(error.to_string().contains("active turn"));

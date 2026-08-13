@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tracing::debug;
 use uuid::Uuid;
@@ -12,9 +13,9 @@ use uuid::Uuid;
 use crate::config::CodexSettings;
 use crate::models::{
     Failure, InterruptReceipt, MessageDelivery, MessageReceipt, MessageTransport, ResumeReceipt,
-    Session, SessionLog, SessionState,
+    Session, SessionLog, SessionState, TurnOutcome,
 };
-use crate::providers::Provider;
+use crate::providers::{Provider, SessionSearchPage};
 use crate::transport::codex_desktop::{CodexDesktopIpc, DesktopMessageDelivery};
 use crate::transport::jsonrpc::{JsonRpcClient, JsonRpcError};
 
@@ -30,6 +31,7 @@ const SOURCE_KINDS: &[&str] = &[
     "subAgentOther",
     "unknown",
 ];
+const MAX_SEARCH_PAGES_PER_REQUEST: usize = 5;
 
 pub struct CodexProvider {
     client: JsonRpcClient,
@@ -37,6 +39,12 @@ pub struct CodexProvider {
     sessions: HashMap<String, Session>,
     watches: HashMap<String, String>,
     watch_supported: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CodexSessionCursor {
+    query: String,
+    provider_cursor: Option<String>,
 }
 
 impl CodexProvider {
@@ -50,11 +58,14 @@ impl CodexProvider {
         })
     }
 
-    fn require_started(&self) -> Result<()> {
-        if !self.started {
-            bail!("Codex provider has not been started");
+    async fn ensure_started(&mut self) -> Result<()> {
+        if self.started && self.client.is_running().await? {
+            return Ok(());
         }
-        Ok(())
+        self.started = false;
+        self.watches.clear();
+        self.sessions.clear();
+        self.start().await
     }
 
     async fn ensure_watches(&mut self, session_ids: &[String]) -> Result<()> {
@@ -153,7 +164,7 @@ impl Provider for CodexProvider {
     }
 
     async fn list_sessions(&mut self, limit: usize) -> Result<Vec<Session>> {
-        self.require_started()?;
+        self.ensure_started().await?;
         let mut sessions = Vec::new();
         let mut cursor: Option<String> = None;
         while sessions.len() < limit {
@@ -194,8 +205,97 @@ impl Provider for CodexProvider {
         Ok(sessions)
     }
 
+    async fn search_sessions(
+        &mut self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionSearchPage> {
+        self.ensure_started().await?;
+        let needle = query.to_ascii_lowercase();
+        let mut position = match cursor {
+            Some(cursor) => {
+                let position: CodexSessionCursor = serde_json::from_str(cursor)
+                    .context("invalid Codex session cursor; refresh the search")?;
+                if position.query != query {
+                    anyhow::bail!("session cursor belongs to another search; refresh the search");
+                }
+                position
+            }
+            None => CodexSessionCursor {
+                query: query.into(),
+                provider_cursor: None,
+            },
+        };
+        let mut sessions = Vec::new();
+        let mut scanned_pages = 0;
+        while sessions.len() < limit && scanned_pages < MAX_SEARCH_PAGES_PER_REQUEST {
+            let page_cursor = position.provider_cursor.clone();
+            let page_limit = usize::min(100, limit - sessions.len());
+            let page = self
+                .client
+                .request(
+                    "thread/list",
+                    json!({
+                        "cursor": page_cursor,
+                        "limit": page_limit,
+                        "sortKey": "updated_at",
+                        "sortDirection": "desc",
+                        "sourceKinds": SOURCE_KINDS,
+                    }),
+                )
+                .await?;
+            scanned_pages += 1;
+            let data = page
+                .get("data")
+                .and_then(Value::as_array)
+                .context("Codex thread/list returned invalid data")?;
+            if data.is_empty() {
+                return Ok(SessionSearchPage {
+                    sessions,
+                    next_cursor: None,
+                });
+            }
+            let next_provider_cursor = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let mut page_matches = Vec::new();
+            for raw in data {
+                let session = parse_session(raw)?;
+                self.sessions.insert(session.id.clone(), session.clone());
+                if needle.is_empty()
+                    || session.title.to_ascii_lowercase().contains(&needle)
+                    || session.id.to_ascii_lowercase().contains(&needle)
+                {
+                    page_matches.push(session);
+                }
+            }
+            sessions.extend(page_matches);
+            let Some(provider_cursor) = next_provider_cursor else {
+                return Ok(SessionSearchPage {
+                    sessions,
+                    next_cursor: None,
+                });
+            };
+            position = CodexSessionCursor {
+                query: query.into(),
+                provider_cursor: Some(provider_cursor),
+            };
+        }
+        let next_cursor = position
+            .provider_cursor
+            .is_some()
+            .then(|| serde_json::to_string(&position))
+            .transpose()?;
+        Ok(SessionSearchPage {
+            sessions,
+            next_cursor,
+        })
+    }
+
     async fn session_logs(&mut self, session_id: &str, limit: usize) -> Result<Vec<SessionLog>> {
-        self.require_started()?;
+        self.ensure_started().await?;
         let result = self
             .client
             .request(
@@ -219,7 +319,7 @@ impl Provider for CodexProvider {
     }
 
     async fn latest_failure(&mut self, session_id: &str) -> Result<Option<Failure>> {
-        self.require_started()?;
+        self.ensure_started().await?;
         let result = self
             .client
             .request(
@@ -289,10 +389,48 @@ impl Provider for CodexProvider {
         }))
     }
 
-    async fn resume(&mut self, session_id: &str, prompt: &str) -> Result<ResumeReceipt> {
-        self.require_started()?;
+    async fn turn_outcome(&mut self, session_id: &str, turn_id: &str) -> Result<TurnOutcome> {
+        self.ensure_started().await?;
+        let result = self
+            .client
+            .request(
+                "thread/read",
+                json!({"threadId": session_id, "includeTurns": true}),
+            )
+            .await?;
+        let turn = result
+            .pointer("/thread/turns")
+            .and_then(Value::as_array)
+            .and_then(|turns| {
+                turns
+                    .iter()
+                    .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
+            });
+        Ok(
+            match turn
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some("inProgress") => TurnOutcome::InProgress,
+                Some("completed") => TurnOutcome::Completed,
+                Some("failed") => TurnOutcome::Failed,
+                _ => TurnOutcome::Unknown,
+            },
+        )
+    }
+
+    async fn resume(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+        idempotency_key: &str,
+    ) -> Result<ResumeReceipt> {
+        self.ensure_started().await?;
         if let Some(mut desktop) = CodexDesktopIpc::connect_default().await? {
-            if let Some(turn_id) = desktop.start_recovery(session_id, prompt).await? {
+            if let Some(turn_id) = desktop
+                .start_recovery(session_id, prompt, idempotency_key)
+                .await?
+            {
                 return Ok(ResumeReceipt {
                     provider: "codex".into(),
                     session_id: session_id.into(),
@@ -306,7 +444,10 @@ impl Provider for CodexProvider {
             .await?;
         let result = self
             .client
-            .request("turn/start", codex_message_params(session_id, prompt))
+            .request_with_unknown_ack(
+                "turn/start",
+                codex_message_params_with_id(session_id, prompt, Some(idempotency_key)),
+            )
             .await?;
         let turn_id = result
             .pointer("/turn/id")
@@ -321,7 +462,7 @@ impl Provider for CodexProvider {
     }
 
     async fn send_message(&mut self, session_id: &str, message: &str) -> Result<MessageReceipt> {
-        self.require_started()?;
+        self.ensure_started().await?;
         if let Some(mut desktop) = CodexDesktopIpc::connect_default().await? {
             let cwd = self.session_cwd(session_id).await;
             if let Some(receipt) = desktop.send_message(session_id, message, &cwd).await? {
@@ -361,7 +502,7 @@ impl Provider for CodexProvider {
     }
 
     async fn interrupt(&mut self, session_id: &str) -> Result<InterruptReceipt> {
-        self.require_started()?;
+        self.ensure_started().await?;
         let turn_id = self
             .active_turn_id(session_id)
             .await?
@@ -398,7 +539,7 @@ impl Provider for CodexProvider {
         session_ids: &[String],
         timeout: Duration,
     ) -> Result<Vec<String>> {
-        self.require_started()?;
+        self.ensure_started().await?;
         if session_ids.is_empty() {
             tokio::time::sleep(timeout).await;
             return Ok(Vec::new());
@@ -439,7 +580,7 @@ impl Provider for CodexProvider {
 }
 
 impl CodexProvider {
-    async fn session_cwd(&self, session_id: &str) -> String {
+    async fn session_cwd(&mut self, session_id: &str) -> String {
         match self
             .client
             .request(
@@ -461,7 +602,7 @@ impl CodexProvider {
         }
     }
 
-    async fn active_turn_id(&self, session_id: &str) -> Result<Option<String>> {
+    async fn active_turn_id(&mut self, session_id: &str) -> Result<Option<String>> {
         let result = match self
             .client
             .request(
@@ -510,9 +651,18 @@ fn current_directory() -> String {
 }
 
 fn codex_message_params(session_id: &str, message: &str) -> Value {
+    codex_message_params_with_id(session_id, message, None)
+}
+
+fn codex_message_params_with_id(
+    session_id: &str,
+    message: &str,
+    client_message_id: Option<&str>,
+) -> Value {
     json!({
         "threadId": session_id,
         "input": [{"type": "text", "text": message}],
+        "clientUserMessageId": client_message_id,
     })
 }
 
@@ -823,7 +973,59 @@ fn is_unsupported_method(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    use tempfile::tempdir;
+
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sparse_search_stops_after_a_bounded_number_of_provider_pages() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("provider.sh");
+        let requests = directory.path().join("requests");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"thread/list"'*)
+      printf 'page\n' >> "$1"
+      printf '{"id":%s,"result":{"data":[{"id":"other","name":"other"}],"nextCursor":"next"}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut provider = CodexProvider::new(&CodexSettings {
+            enabled: true,
+            command: vec![
+                script.to_string_lossy().into_owned(),
+                requests.to_string_lossy().into_owned(),
+            ],
+        })
+        .unwrap();
+
+        let page = provider
+            .search_sessions("missing", None, 100)
+            .await
+            .unwrap();
+        provider.close().await.unwrap();
+
+        assert!(page.sessions.is_empty());
+        assert!(page.next_cursor.is_some());
+        assert_eq!(
+            std::fs::read_to_string(requests).unwrap().lines().count(),
+            5
+        );
+    }
 
     #[test]
     fn message_params_preserve_multiline_text() {

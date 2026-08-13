@@ -20,7 +20,13 @@ it. Protect the config, watchlist, and state directories from other users. The
 watchlist is an authorization boundary: anyone who can edit it can authorize a
 session for automatic continuation.
 
-Watchcat intentionally has no HTTP server, telemetry, or credential store.
+Watchcat intentionally has no TCP or HTTP server, telemetry, or credential
+store. `watchcatd` exposes only a local versioned RPC endpoint.
+
+On Unix, the daemon creates its state directory with mode `0700` and its socket
+with mode `0600`. On macOS and Linux it also rejects connected peers whose UID
+does not match the daemon's effective UID. Mutations may use revision checks to
+prevent a stale client from overwriting newer settings.
 
 ## Codex Desktop IPC
 

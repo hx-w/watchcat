@@ -26,6 +26,16 @@ pub enum SessionState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    InProgress,
+    Completed,
+    Failed,
+    #[default]
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub provider: String,
@@ -119,8 +129,12 @@ pub struct WatchTarget {
     pub session_id: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub protected: bool,
     pub label: Option<String>,
     pub added_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<DateTime<Utc>>,
 }
 
 impl WatchTarget {

@@ -8,14 +8,18 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
+use watchcat::client::WatchcatClient;
 use watchcat::conditions::is_known;
 use watchcat::config::{
-    Paths, Settings, display_settings, initialize_config, load_settings, save_settings,
+    Paths, PolicyOverride, Settings, display_settings, initialize_config, load_settings,
+    save_settings,
 };
-use watchcat::engine::WatchEngine;
+use watchcat::engine::{RecoveryPermit, WatchEngine};
 use watchcat::models::{BackoffKind, MessageTransport, PolicyAction, SessionLog, WatchTarget};
 use watchcat::providers::{CodexProvider, Provider};
-use watchcat::state::{EventLogStore, ProcessLock, RuntimeState, WatchlistStore};
+use watchcat::state::{
+    ControlStateStore, EventLogStore, ProcessLock, RuntimeState, WatchlistStore,
+};
 use watchcat::transport::codex_desktop::CodexDesktopIpc;
 
 #[derive(Debug, Parser)]
@@ -249,19 +253,344 @@ async fn run() -> Result<()> {
         Command::Config {
             command: ConfigCommand::Init { force },
         } => {
+            let _lock = ProcessLock::acquire(paths.lock_file.clone())?;
             initialize_config(&paths.config_file, force)?;
             println!("Wrote {}", paths.config_file.display());
         }
         Command::Config {
             command: ConfigCommand::Path(args),
         } => emit_value(&path_value(&paths), args.json)?,
+        Command::Config { command } => {
+            let settings = load_settings(&paths.config_file)?;
+            config_command(&settings, &paths, command)?;
+        }
         command => {
+            if paths.socket_file.exists() && !matches!(command, Command::Run(_)) {
+                match ProcessLock::acquire(paths.lock_file.clone()) {
+                    Err(_) => return dispatch_daemon(command, &paths).await,
+                    Ok(lock) => drop(lock),
+                }
+            }
+            let _direct_lock = if matches!(command, Command::Run(_)) {
+                None
+            } else {
+                Some(ProcessLock::acquire(paths.lock_file.clone()).with_context(
+                    || "Watchcat service owns this state but its control socket is unavailable",
+                )?)
+            };
             let settings = load_settings(&paths.config_file)?;
             let watchlist = WatchlistStore::new(paths.watchlist_file.clone());
             dispatch(command, settings, paths, watchlist).await?;
         }
     }
     Ok(())
+}
+
+async fn dispatch_daemon(command: Command, paths: &Paths) -> Result<()> {
+    let client = WatchcatClient::new(paths.socket_file.clone());
+    match command {
+        Command::Status(args) => {
+            let (value, _) = client.request("snapshot.get", json!({}), None).await?;
+            if args.json {
+                emit_value(&value, true)
+            } else {
+                println!(
+                    "Watchcat service online · {} watched · {} paused · {} need attention",
+                    value["watched"].as_u64().unwrap_or(0),
+                    value["paused"].as_u64().unwrap_or(0),
+                    value["attention"].as_u64().unwrap_or(0)
+                );
+                println!(
+                    "This month: {} automatic recoveries · {}% hands-free",
+                    value["automatic_recoveries"].as_u64().unwrap_or(0),
+                    value["hands_free_percent"].as_u64().unwrap_or(100)
+                );
+                Ok(())
+            }
+        }
+        Command::Session { command } => daemon_session_command(&client, command).await,
+        Command::Watch { command } => daemon_watch_command(&client, command).await,
+        Command::Policy { command } => daemon_policy_command(&client, command).await,
+        Command::Doctor(args) => {
+            let (value, _) = client.request("service.ping", json!({}), None).await?;
+            if args.json {
+                emit_value(
+                    &json!([{"name":"watchcat_service","ok":true,"detail":value}]),
+                    true,
+                )
+            } else {
+                println!("CHECK      RESULT  DETAIL");
+                println!(
+                    "service   ok      connected at {}",
+                    paths.socket_file.display()
+                );
+                Ok(())
+            }
+        }
+        Command::Run(_) | Command::Config { .. } => unreachable!(),
+    }
+}
+
+async fn daemon_session_command(client: &WatchcatClient, command: SessionCommand) -> Result<()> {
+    match command {
+        SessionCommand::List(args) => {
+            let (value, _) = client
+                .request(
+                    "sessions.list",
+                    json!({"provider": args.provider, "limit": args.limit}),
+                    None,
+                )
+                .await?;
+            let items = value["items"].as_array().cloned().unwrap_or_default();
+            if args.json {
+                emit_value(&Value::Array(items), true)
+            } else {
+                let rows = items
+                    .iter()
+                    .map(|item| {
+                        vec![
+                            if item["watched"].as_bool().unwrap_or(false) {
+                                "*"
+                            } else {
+                                ""
+                            }
+                            .into(),
+                            item["session"]["id"].as_str().unwrap_or_default().into(),
+                            item["session"]["state"].as_str().unwrap_or_default().into(),
+                            item["session"]["title"].as_str().unwrap_or_default().into(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(&["WATCH", "SESSION", "STATE", "TITLE"], &rows);
+                Ok(())
+            }
+        }
+        SessionCommand::Show(args) => {
+            let (value, _) = client
+                .request(
+                    "sessions.list",
+                    json!({"provider": args.provider, "limit": 1, "query": args.session_id}),
+                    None,
+                )
+                .await?;
+            let session = value["items"]
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("session"))
+                .cloned()
+                .context("session not found")?;
+            emit_value(&session, true || args.json)
+        }
+        SessionCommand::Logs(args) => {
+            let (value, _) = client
+                .request(
+                    "sessions.logs",
+                    json!({
+                        "provider": args.provider,
+                        "session_id": args.session_id,
+                        "limit": args.limit,
+                        "category": args.category,
+                    }),
+                    None,
+                )
+                .await?;
+            if args.json {
+                emit_value(&value, true)
+            } else {
+                let logs: Vec<SessionLog> = serde_json::from_value(value)?;
+                print_logs(&logs);
+                Ok(())
+            }
+        }
+        SessionCommand::Send(args) => {
+            let message = message_input(args.message)?;
+            let (value, _) = client
+                .request(
+                    "sessions.send",
+                    json!({"provider": args.provider, "session_id": args.session_id, "message": message}),
+                    None,
+                )
+                .await?;
+            if args.json {
+                emit_value(&value, true)
+            } else {
+                println!(
+                    "Sent message to {}:{}",
+                    value["provider"], value["session_id"]
+                );
+                Ok(())
+            }
+        }
+        SessionCommand::Interrupt(args) => {
+            let (value, _) = client
+                .request(
+                    "sessions.interrupt",
+                    json!({"provider": args.provider, "session_id": args.session_id}),
+                    None,
+                )
+                .await?;
+            if args.json {
+                emit_value(&value, true)
+            } else {
+                println!("Interrupted {}:{}", value["provider"], value["session_id"]);
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn daemon_watch_command(client: &WatchcatClient, command: WatchCommand) -> Result<()> {
+    let (_, revision) = client.request("snapshot.get", json!({}), None).await?;
+    match command {
+        WatchCommand::List(args) => {
+            let (value, _) = client.request("watch.list", json!({}), None).await?;
+            if args.json {
+                emit_value(&value, true)
+            } else {
+                let targets: Vec<WatchTarget> = serde_json::from_value(value)?;
+                let rows = targets
+                    .iter()
+                    .map(|target| {
+                        vec![
+                            target.provider.clone(),
+                            target.session_id.clone(),
+                            if target.enabled { "active" } else { "paused" }.into(),
+                            if target.protected { "yes" } else { "" }.into(),
+                            target.label.clone().unwrap_or_default(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(
+                    &["PROVIDER", "SESSION", "STATE", "PROTECTED", "LABEL"],
+                    &rows,
+                );
+                Ok(())
+            }
+        }
+        WatchCommand::Add {
+            session_id,
+            provider,
+            label,
+            no_validate,
+        } => {
+            let (value, _) = client.request(
+                "watch.add",
+                json!({"provider": provider, "session_id": session_id, "label": label, "validate": !no_validate}),
+                Some(revision),
+            ).await?;
+            println!(
+                "{}",
+                if value["added"].as_bool() == Some(true) {
+                    "Watching"
+                } else {
+                    "Already watching"
+                }
+            );
+            Ok(())
+        }
+        WatchCommand::Remove(args) => {
+            let (value, _) = client
+                .request(
+                    "watch.remove",
+                    json!({"provider": args.provider, "session_id": args.session_id}),
+                    Some(revision),
+                )
+                .await?;
+            println!(
+                "{}",
+                if value["removed"].as_bool() == Some(true) {
+                    "Removed"
+                } else {
+                    "Not watched"
+                }
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn daemon_policy_command(client: &WatchcatClient, command: PolicyCommand) -> Result<()> {
+    let (_, revision) = client.request("snapshot.get", json!({}), None).await?;
+    match command {
+        PolicyCommand::List(args) => {
+            let (value, _) = client.request("policies.list", json!({}), None).await?;
+            let mut policies: Vec<watchcat::config::ResolvedPolicy> =
+                serde_json::from_value(value)?;
+            policies.retain(|policy| {
+                args.category
+                    .as_deref()
+                    .is_none_or(|category| policy.condition.split('.').next() == Some(category))
+            });
+            if args.json {
+                emit_serializable(&policies, true)
+            } else {
+                print_policies(&policies);
+                Ok(())
+            }
+        }
+        PolicyCommand::Show { condition, json } => {
+            require_condition(&condition)?;
+            let (value, _) = client.request("policies.list", json!({}), None).await?;
+            let policies: Vec<watchcat::config::ResolvedPolicy> = serde_json::from_value(value)?;
+            let policy = policies
+                .into_iter()
+                .find(|policy| policy.condition == condition)
+                .context("policy not found")?;
+            if json {
+                emit_serializable(&policy, true)
+            } else {
+                print_policy_details(&policy);
+                Ok(())
+            }
+        }
+        PolicyCommand::Set(args) => {
+            require_condition(&args.condition)?;
+            if args.action.is_none()
+                && args.backoff.is_none()
+                && args.initial_delay.is_none()
+                && args.max_delay.is_none()
+                && args.max_attempts.is_none()
+                && args.prompt.is_none()
+            {
+                bail!("policy set requires at least one option");
+            }
+            let policy = PolicyOverride {
+                action: args.action.map(|value| match value {
+                    ActionArg::Retry => PolicyAction::Retry,
+                    ActionArg::Skip => PolicyAction::Skip,
+                }),
+                backoff: args.backoff.map(|value| match value {
+                    BackoffArg::Fixed => BackoffKind::Fixed,
+                    BackoffArg::Exponential => BackoffKind::Exponential,
+                }),
+                initial_delay_seconds: args.initial_delay,
+                max_delay_seconds: args.max_delay,
+                max_attempts: args.max_attempts,
+                prompt: args.prompt,
+            };
+            client
+                .request(
+                    "policies.set",
+                    json!({"condition": args.condition, "policy": policy}),
+                    Some(revision),
+                )
+                .await?;
+            println!("Updated {}", args.condition);
+            Ok(())
+        }
+        PolicyCommand::Reset { condition, all } => {
+            let params = if all {
+                json!({})
+            } else {
+                json!({"condition": condition.context("provide CONDITION or use --all")?})
+            };
+            client
+                .request("policies.reset", params, Some(revision))
+                .await?;
+            println!("Reset policy configuration");
+            Ok(())
+        }
+    }
 }
 
 async fn dispatch(
@@ -444,8 +773,10 @@ async fn watch_command(
                 provider,
                 session_id,
                 enabled: true,
+                protected: false,
                 label,
                 added_at: Utc::now(),
+                last_event_at: None,
             };
             let added = watchlist.add(target.clone())?;
             println!(
@@ -767,17 +1098,40 @@ async fn run_watchdog(
     if targets.is_empty() {
         bail!("watchlist is empty; add at least one session before running");
     }
-    let _lock = ProcessLock::acquire(paths.lock_file)?;
+    let _lock = ProcessLock::acquire(paths.lock_file.clone())?;
+    let state = RuntimeState::load(paths.state_file.clone())?;
+    let mut control = ControlStateStore::load(
+        paths.control_state_file.clone(),
+        state.guard_state(),
+        state.revision(),
+    )?;
+    let now = Utc::now();
+    let (mut guard_enabled, paused_until) = control.guard_state();
+    if !guard_enabled && paused_until.is_some_and(|until| now >= until) {
+        control.set_guard_state_and_advance(true, None)?;
+        guard_enabled = true;
+    }
+    if !guard_enabled {
+        bail!("guard is disabled; enable it before starting direct mode");
+    }
     let mut providers = build_providers(
         &settings,
         targets.iter().map(|target| target.provider.as_str()),
     )?;
     start_providers(&mut providers).await?;
-    let state = RuntimeState::load(paths.state_file)?;
     let event_log = EventLogStore::new(paths.event_log_file, settings.engine.log_retention);
     let config_file = paths.config_file.clone();
     let target_count = targets.len();
-    let mut engine = WatchEngine::new(settings, providers, targets, state, event_log, args.dry_run);
+    let recovery_permit = RecoveryPermit::new(true, &targets, control.revision());
+    let mut engine = WatchEngine::new_with_permit(
+        settings,
+        providers,
+        targets,
+        state,
+        event_log,
+        args.dry_run,
+        recovery_permit,
+    );
     let result = if args.once {
         let events = engine.run_once(Utc::now()).await?;
         if args.json {
@@ -805,7 +1159,13 @@ async fn run_watchdog(
             "watchcat started"
         );
         engine
-            .run_forever_with(|| Ok((Some(watchlist.list()?), Some(load_settings(&config_file)?))))
+            .run_forever_with(|| {
+                Ok((
+                    Some(watchlist.list()?),
+                    Some(load_settings(&config_file)?),
+                    guard_enabled,
+                ))
+            })
             .await
     };
     engine.close().await;
@@ -1009,7 +1369,7 @@ fn require_condition(condition: &str) -> Result<()> {
 }
 
 fn path_value(paths: &Paths) -> Value {
-    json!({"config": paths.config_file, "watchlist": paths.watchlist_file, "state": paths.state_file, "events": paths.event_log_file, "lock": paths.lock_file})
+    json!({"config": paths.config_file, "watchlist": paths.watchlist_file, "state": paths.state_file, "control": paths.control_state_file, "events": paths.event_log_file, "retry_operations": paths.retry_operations_file, "lock": paths.lock_file})
 }
 
 fn build_providers<'a>(

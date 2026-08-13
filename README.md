@@ -2,245 +2,203 @@
 
 [![CI](https://github.com/hx-w/watchcat/actions/workflows/ci.yml/badge.svg)](https://github.com/hx-w/watchcat/actions/workflows/ci.yml)
 [![Security audit](https://github.com/hx-w/watchcat/actions/workflows/security.yml/badge.svg)](https://github.com/hx-w/watchcat/actions/workflows/security.yml)
-[![Release](https://img.shields.io/github/v/release/hx-w/watchcat?display_name=tag)](https://github.com/hx-w/watchcat/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/hx-w/watchcat/total)](https://github.com/hx-w/watchcat/releases)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-dea584?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/github/license/hx-w/watchcat)](LICENSE)
 
-Watchcat resumes interrupted AI coding sessions after failures you choose. It
-watches an explicit session list, classifies structured provider errors, applies
-a configurable policy, and sends a continuation only after rechecking the
-latest turn.
+Watchcat is a local reliability manager for AI coding sessions. `watchcatd`
+owns provider connections, watches an explicit session list, classifies
+structured failures, and applies bounded recovery policies. The CLI and native
+macOS client are control surfaces for the same daemon.
 
-Codex sessions are supported. Claude Code's official failure codes are already
-part of the provider-neutral condition model, but Claude session discovery and
-resume are not included in this release.
+Codex sessions are supported. Claude Code failure codes are part of the shared
+condition model, but a Claude session adapter is not included yet.
 
-## Install or update
+## Architecture
 
-macOS and Linux:
+```text
+macOS menu bar app ─┐
+                    ├─ framed JSON RPC ─ watchcatd ─ Codex App Server
+watchcat CLI ───────┘     local socket      │
+                                             ├─ policies and hot reload
+                                             ├─ watchlist and lifecycle
+                                             └─ runtime state and events
+```
+
+The service listens only on a current-user Unix socket. It does not open a TCP
+port or store provider credentials. The socket directory is mode `0700`, the
+socket is mode `0600`, and macOS/Linux peers must have the daemon user's UID.
+
+## Build the macOS client
+
+The native SwiftUI client requires macOS 13 or newer. It provides a compact menu
+bar surface and a full window for watchlist, policy, activity, and connection
+management.
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.sh | sh
+./scripts/build-macos-app.sh
+open dist/Watchcat.app
 ```
 
-Windows PowerShell:
+The app bundle contains the service, CLI, and a bundled LaunchAgent. Enabling
+launch at login also synchronizes the matching CLI and service to
+`~/.local/bin`. Make sure that directory precedes any older Watchcat install in
+your shell's `PATH`.
 
-```powershell
-irm https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.ps1 | iex
+The GitHub Release includes Intel and Apple Silicon preview app archives. They
+are ad-hoc signed and require a one-time macOS Privacy & Security approval; see
+the README inside each archive. Trusted distribution without that manual step
+still requires Developer ID signing and notarization.
+
+## Install or update the CLI and service
+
+macOS and Linux release archives include `watchcat` and `watchcatd`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.sh | sh
 ```
 
-The installers download the latest native GitHub Release, verify its SHA-256
-checksum, and replace the existing binary. Run the same command again to update.
-They support Linux x86-64 and ARM64, macOS Intel and Apple Silicon, and Windows
-x86-64.
+Run the same command again to update. The installer verifies the release
+checksum and replaces both `watchcat` and `watchcatd`. Stop a manually launched
+service before updating, then restart it after installation. The macOS app uses
+its bundled service and updates it with the app. Upgrade CLI and service
+together: version 3 configuration written by Watchcat 0.4 is not readable by
+0.3.x.
 
 Install a specific version or destination when reproducibility matters:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.sh \
-  | WATCHCAT_VERSION=v0.3.1 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
-```
-
-```powershell
-$env:WATCHCAT_VERSION = "v0.3.1"
-$env:WATCHCAT_INSTALL_DIR = "$HOME\bin"
-irm https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.ps1 | iex
+  | WATCHCAT_VERSION=v0.4.0 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
 ```
 
 Building from source requires Rust 1.85 or newer:
 
 ```bash
-cargo install --git https://github.com/hx-w/watchcat --locked
+cargo install --git https://github.com/hx-w/watchcat --locked --bins
 ```
+
+Windows users can rerun `scripts/install.ps1` to update the CLI. Windows
+continues to support direct CLI mode; the service's named-pipe
+transport is not included in 0.4.0.
 
 ## Quick start
 
-Watchcat uses the authenticated `codex` command already installed on the same
-machine. It needs no separate OpenAI API key.
+Watchcat uses the authenticated `codex` command on the same machine. It needs no
+separate OpenAI API key.
 
 ```bash
+watchcat config init
 watchcat doctor
+watchcatd
+```
+
+In another terminal:
+
+```bash
 watchcat session list
 watchcat watch add SESSION_ID --label "release task"
-
-# Send an explicit instruction without adding the session to the watchlist.
-watchcat session send SESSION_ID "Continue with the release checklist."
-
-# Stop the session's active turn explicitly.
-watchcat session interrupt SESSION_ID
-
-# Inspect the effective policy and exercise it without sending a prompt.
-watchcat policy list --category capacity
-watchcat run --once --dry-run
-
-# Keep watching until interrupted.
-watchcat -v run
+watchcat status
 ```
 
-Use `watchcat watch remove SESSION_ID` to revoke permission. A running watchdog
-reloads the watchlist before its next reconciliation. It never infers permission
-from pinned, recent, or active sessions.
+When `watchcatd` is online, status, session, watchlist, and policy commands use
+RPC. Without the daemon, the CLI retains its direct compatibility mode.
 
-For unattended operation, see the systemd, launchd, and Windows Task Scheduler
-examples in [Running in the background](docs/background.md).
+## Watchlist and lifecycle
 
-## Recovery policies
-
-Conditions are stable names shared by every provider. Network, capacity,
-conflict, server, and provider retry-exhaustion conditions retry by default.
-Authentication, billing, capability, context, quota, request, sandbox, and
-unknown conditions skip by default.
-
-```console
-$ watchcat policy list --category capacity
-CONDITION                     ACTION  BACKOFF      MAX  CUSTOM
-----------------------------  ------  -----------  ---  ------
-capacity.model_overloaded     retry   exponential  5    no
-capacity.service_overloaded   retry   exponential  5    no
-capacity.rate_limited         retry   exponential  5    no
-capacity.server_throttled     retry   exponential  5    no
-```
-
-Every policy field can be changed from the CLI:
+Only explicitly watched sessions may be recovered automatically:
 
 ```bash
+watchcat watch list
+watchcat watch add SESSION_ID
+watchcat watch remove SESSION_ID
+```
+
+Version 3 configuration includes lifecycle cleanup:
+
+```toml
+[lifecycle]
+stale_after_seconds = 259200
+sweep_interval_seconds = 60
+protect_unresolved_failures = true
+```
+
+The default removes a watch entry after three days without provider or Watchcat
+activity. Protected targets, unresolved failures, and targets whose provider
+could not be checked are retained. Cleanup never deletes the provider session.
+
+## Policies
+
+Every known condition is editable. A retry policy owns its action, backoff kind,
+initial and maximum delays, attempt limit, and exact recovery prompt.
+
+```bash
+watchcat policy list
 watchcat policy set capacity.model_overloaded \
   --action retry \
   --backoff exponential \
   --initial-delay 15s \
   --max-delay 5m \
   --max-attempts 8 \
-  --prompt "The {model} model is overloaded. Continue the unfinished task. Attempt {attempt}/{max_attempts}."
+  --prompt "Continue the unfinished task. Attempt {attempt}/{max_attempts}."
 ```
 
-Actions are `retry` and `skip`. Backoff is `fixed` or `exponential`. Durations
-accept seconds by default, or the `s`, `m`, and `h` suffixes. Prompt templates
-support `{provider}`, `{model}`, `{condition}`, `{provider_code}`, `{attempt}`,
-and `{max_attempts}`.
+Prompt templates support `{provider}`, `{model}`, `{condition}`,
+`{provider_code}`, `{attempt}`, and `{max_attempts}`. Unknown conditions skip by
+default. Daemon-side changes are validated, written atomically, and published as
+a new revision. Valid external edits are hot-reloaded; invalid edits leave the
+last good settings active.
 
-Use `watchcat policy show CONDITION`, `watchcat policy reset CONDITION`, or
-`watchcat policy reset --all` to inspect or restore settings. There are no
-provider-specific `codes` or `capabilities` commands; condition discovery and
-editing belong to `policy`.
-
-## Session logs
-
-`session logs` merges recent provider turns and messages with Watchcat's own
-retry lifecycle. Watchcat events include matched conditions, delays, attempts,
-the exact retry prompt, and the continuation result.
+## Session actions and activity
 
 ```bash
+watchcat session send SESSION_ID "Continue with the release checklist."
+watchcat session interrupt SESSION_ID
 watchcat session logs SESSION_ID --limit 30
 watchcat session logs SESSION_ID --category capacity
-watchcat session logs SESSION_ID --json
 ```
 
-Provider messages are read on demand. Watchcat stores only its bounded JSONL
-event history, which may contain provider failure text and retry prompts.
+Activity is always scoped to a named session. Watchcat stores a bounded JSONL
+history of failure and recovery events, not a copy of the full conversation.
+Provider messages are read on demand.
 
-## Control a session
+Manual retry is accepted as a durable background operation and returns an
+operation ID before provider work begins. Repeating an unacknowledged request
+returns the existing operation. The client follows it to success, failure, or
+an explicit unknown result when a provider acknowledgement is lost or the
+service restarts; it never claims that an uncertain recovery was not sent.
 
-Send a one-off instruction directly to a session. For sessions owned by Codex
-Desktop, Watchcat asks the owning window to steer its active turn or start a new
-one through the local Desktop IPC router. This avoids competing for the App
-Server's single-writer lock. If Desktop is not running or does not own the
-session, Watchcat falls back to a standalone Codex App Server connection.
+The recovery counter advances only after the recovery turn is observed as
+completed. Starting a retry is not counted as success. The hands-free percentage
+is automatic successful recoveries divided by all successful recoveries.
 
-These are explicit user actions, so the session does not need to be in the
-automatic recovery watchlist and recovery policies do not limit them.
+## Safety invariants
 
-```bash
-watchcat session send SESSION_ID "Review the current diff and fix the test."
-printf '%s\n' 'Read the release checklist.' 'Then continue.' \
-  | watchcat session send SESSION_ID
-watchcat session send SESSION_ID "Report status" --json
-watchcat session interrupt SESSION_ID
-watchcat session interrupt SESSION_ID --json
-```
-
-`session interrupt` requires an active turn and targets its exact turn ID. An
-empty message argument or empty standard input is rejected. `--provider codex`
-is the current default; both commands are provider-neutral so future adapters
-can expose the same contract.
-
-Codex Desktop IPC is a private, versioned local protocol rather than a public
-OpenAI API. Watchcat validates protocol versions and endpoint ownership and
-fails closed when compatibility is unknown. Run `watchcat doctor` after a Codex
-Desktop update. See [Codex Desktop IPC](docs/codex-desktop-ipc.md) for the
-compatibility and fallback contract.
-
-## Commands
-
-| Command | Purpose |
-| --- | --- |
-| `watchcat status` | Show watched sessions and their latest condition |
-| `watchcat run` | Watch continuously |
-| `watchcat run --once --dry-run` | Evaluate once without sending anything |
-| `watchcat session list` | List recent provider sessions |
-| `watchcat session show ID` | Show one provider session |
-| `watchcat session logs ID` | Show structured provider and retry history |
-| `watchcat session send ID MESSAGE` | Steer an active turn or start a new one |
-| `watchcat session interrupt ID` | Stop the exact active turn |
-| `watchcat watch list` | List explicitly watched sessions |
-| `watchcat watch add ID` | Add one session to the watchlist |
-| `watchcat watch remove ID` | Remove one session from the watchlist |
-| `watchcat policy list` | List configurable conditions and effective actions |
-| `watchcat policy show CONDITION` | Show one effective policy |
-| `watchcat policy set CONDITION` | Change retry, backoff, limit, or prompt fields |
-| `watchcat policy reset CONDITION` | Restore built-in defaults |
-| `watchcat config init` | Write a documented configuration |
-| `watchcat config show` | Print the effective configuration |
-| `watchcat config path` | Print native configuration and state paths |
-| `watchcat config validate` | Validate configuration without connecting |
-| `watchcat doctor` | Check configuration and Codex connectivity |
-
-Commands with structured output support `--json`.
-
-## Safety and storage
-
-The engine enforces these invariants:
-
-- Only explicitly watched sessions can change.
+- Only explicitly watched sessions can change automatically.
 - Each failed turn is handled at most once.
 - Every retry is delayed and bounded.
-- The failed turn is read again immediately before sending a prompt.
+- The failed turn is rechecked immediately before a continuation is sent.
 - A changed session cancels the pending continuation.
-- Automatic recovery only starts a new turn; it never steers active work.
+- Automatic recovery starts a new turn and never steers active work.
 - Unknown failures skip by default.
-- Dry-run mode never sends or marks a failure handled.
-- One state directory can have only one active runner.
+- One daemon or direct runner owns a state directory.
+- Mutations can carry an expected revision and fail on stale client state.
 
-`watchcat config path --json` prints the active paths. The environment variables
-`WATCHCAT_CONFIG_DIR`, `WATCHCAT_STATE_DIR`, and `WATCHCAT_WATCHLIST` override
-local storage.
+Configuration, watchlist, and runtime-state schemas are version 3. Version 2
+files migrate automatically and are rewritten atomically. Version 1 remains
+unsupported.
 
-Versions 0.2 and 0.3 use configuration, watchlist, and runtime-state schema 2.
-Version 1 files are intentionally unsupported. Run
-`watchcat config init --force`, review the new configuration, and rebuild the
-watchlist when upgrading from 0.1.
-
-Watchcat does not expose a network listener or store provider credentials. Its
-Desktop integration connects only to the current user's local IPC endpoint.
-Read the [Security policy](SECURITY.md) before running it on a shared machine.
-
-## Development and releases
+## Development
 
 ```bash
 cargo test --all-targets --locked
 cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo package --locked
+swift test --package-path clients/macos
 ```
 
-CI tests Linux, macOS, and Windows, checks Rust 1.85 compatibility, lints the
-shell installer, and verifies crate packaging. A matching version tag builds
-five native archives, publishes checksums, creates the GitHub Release, and runs
-real installer tests on Linux, macOS, and Windows.
-
-Read [Contributing](CONTRIBUTING.md) before proposing a provider or changing the
-condition catalog. User-visible changes belong in [Changelog](CHANGELOG.md).
+See [Architecture](docs/architecture.md), [Background services](docs/background.md),
+and the [Security policy](SECURITY.md).
 
 ## License
 

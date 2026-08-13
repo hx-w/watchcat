@@ -1,10 +1,16 @@
 # Copy to the path printed by `watchcat config path`, or run `watchcat config init`.
-version = 2
+version = 3
 
 [engine]
 poll_interval_seconds = 10
 attempt_window_seconds = 3600
 log_retention = 10000
+
+# A target is removed from Watchcat only. The provider session is never deleted.
+[lifecycle]
+stale_after_seconds = 259200
+sweep_interval_seconds = 60
+protect_unresolved_failures = true
 
 [providers.codex]
 enabled = true

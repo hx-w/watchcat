@@ -27,8 +27,18 @@ jobs:
           test "v${crate_version}" = "${GITHUB_REF_NAME}"
           cargo test --all-targets --locked
 
+  validate-macos-client:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test client and verify app bundle
+        run: |
+          swift test --package-path clients/macos
+          bash scripts/build-macos-app.sh
+          codesign --verify --deep --strict dist/Watchcat.app
+
   build:
-    needs: validate
+    needs: [validate, validate-macos-client]
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +63,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
       - run: rustup default stable
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --bins --target ${{ matrix.target }}
       - name: Package Unix binary
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -62,6 +72,7 @@ jobs:
           staging="watchcat-${{ matrix.target }}"
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/watchcat" "$staging/"
+          cp "target/${{ matrix.target }}/release/watchcatd" "$staging/"
           cp README.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
       - name: Package Windows binary
@@ -79,8 +90,116 @@ jobs:
           path: watchcat-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error
 
+  build-macos-app:
+    needs: [validate, validate-macos-client]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            architecture: x86_64
+          - os: macos-latest
+            architecture: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build ad-hoc signed app preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/build-macos-app.sh
+          codesign --verify --deep --strict dist/Watchcat.app
+          staging="Watchcat-macos-${{ matrix.architecture }}-preview"
+          mkdir "$staging"
+          cp -R dist/Watchcat.app "$staging/"
+          cp docs/macos-preview.md "$staging/README.md"
+          ditto -c -k --sequesterRsrc --keepParent "$staging" "${staging}.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Watchcat-macos-${{ matrix.architecture }}-preview
+          path: Watchcat-macos-${{ matrix.architecture }}-preview.zip
+          if-no-files-found: error
+
+  smoke-artifacts:
+    needs: [build, build-macos-app]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Verify release payload before publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find artifacts -maxdepth 1 -type f | wc -l)" -eq 7
+          test -f artifacts/Watchcat-macos-aarch64-preview.zip
+          test -f artifacts/Watchcat-macos-x86_64-preview.zip
+          for archive in artifacts/watchcat-*.tar.gz; do
+            tar -tzf "$archive" | grep -q '/watchcat$'
+            tar -tzf "$archive" | grep -q '/watchcatd$'
+          done
+          unzip -l artifacts/watchcat-x86_64-pc-windows-msvc.zip | grep -q 'watchcat.exe'
+
+  installers:
+    needs: [build, smoke-artifacts]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: Start local release server
+        shell: bash
+        run: |
+          if command -v python3 >/dev/null 2>&1; then
+            python_command=python3
+          else
+            python_command=python
+          fi
+          "$python_command" -m http.server 8765 --directory release-files >"${RUNNER_TEMP}/watchcat-http.log" 2>&1 &
+          for attempt in 1 2 3 4 5; do
+            curl -fsS http://127.0.0.1:8765/ >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8765/ >/dev/null
+      - name: Smoke test shell installer
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          WATCHCAT_RELEASE_BASE_URL: http://127.0.0.1:8765
+        run: |
+          set -euo pipefail
+          cd release-files
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum watchcat-* > SHA256SUMS
+          else
+            shasum -a 256 watchcat-* > SHA256SUMS
+          fi
+          cd ..
+          destination="${RUNNER_TEMP}/watchcat-bin"
+          bash scripts/install.sh --version "${GITHUB_REF_NAME}" --to "$destination"
+          test "$("${destination}/watchcat" --version)" = "watchcat ${GITHUB_REF_NAME#v}"
+          test "$("${destination}/watchcatd" --version)" = "watchcatd ${GITHUB_REF_NAME#v}"
+      - name: Smoke test PowerShell installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WATCHCAT_RELEASE_BASE_URL: http://127.0.0.1:8765
+        run: |
+          Get-ChildItem release-files/watchcat-* | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Set-Content release-files/SHA256SUMS
+          $destination = Join-Path $env:RUNNER_TEMP "watchcat-bin"
+          ./scripts/install.ps1 -Version $env:GITHUB_REF_NAME -InstallDir $destination
+          $actual = & (Join-Path $destination "watchcat.exe") --version
+          $expected = "watchcat " + $env:GITHUB_REF_NAME.Substring(1)
+          if ($actual -ne $expected) { throw "Expected '$expected', got '$actual'" }
+
   publish:
-    needs: build
+    needs: [build, build-macos-app, smoke-artifacts, installers]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -91,7 +210,7 @@ jobs:
           path: artifacts
           merge-multiple: true
       - name: Create checksums
-        run: cd artifacts && sha256sum watchcat-* > SHA256SUMS
+        run: cd artifacts && sha256sum * > SHA256SUMS
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,31 +218,5 @@ jobs:
           gh release create "${GITHUB_REF_NAME}"
           artifacts/*
           --verify-tag
-          --generate-notes
+          --notes-file docs/release-v0.4.0.md
           --title "Watchcat ${GITHUB_REF_NAME}"
-
-  installers:
-    needs: publish
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Smoke test shell installer
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          destination="${RUNNER_TEMP}/watchcat-bin"
-          bash scripts/install.sh --version "${GITHUB_REF_NAME}" --to "$destination"
-          test "$("${destination}/watchcat" --version)" = "watchcat ${GITHUB_REF_NAME#v}"
-      - name: Smoke test PowerShell installer
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $destination = Join-Path $env:RUNNER_TEMP "watchcat-bin"
-          ./scripts/install.ps1 -Version $env:GITHUB_REF_NAME -InstallDir $destination
-          $actual = & (Join-Path $destination "watchcat.exe") --version
-          $expected = "watchcat " + $env:GITHUB_REF_NAME.Substring(1)
-          if ($actual -ne $expected) { throw "Expected '$expected', got '$actual'" }

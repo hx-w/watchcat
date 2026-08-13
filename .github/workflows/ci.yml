@@ -30,6 +30,17 @@ jobs:
       - run: rustup default stable
       - run: cargo test --all-targets --locked
 
+  macos-client:
+    name: macOS client
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: swift test --package-path clients/macos
+      - name: Build and verify app bundle
+        run: |
+          bash scripts/build-macos-app.sh
+          codesign --verify --deep --strict dist/Watchcat.app
+
   quality:
     name: Format and Clippy
     runs-on: ubuntu-latest
@@ -45,7 +56,7 @@ jobs:
           sudo apt-get install --yes shellcheck
           shellcheck scripts/install.sh
           bash -n scripts/install.sh
-          scripts/install.sh --version v0.3.1 --dry-run
+          scripts/install.sh --version v0.4.0 --dry-run
 
   package:
     name: Package crate

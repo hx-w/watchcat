@@ -4,6 +4,42 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-13
+
+### Added
+
+- Long-running `watchcatd` service with a versioned, framed local RPC protocol,
+  push notifications, revision checks, and atomic configuration hot reload.
+- Native macOS 13 menu bar client for guard control, watchlist management,
+  per-session activity, full policy editing, and LaunchAgent setup.
+- Configurable stale-watch cleanup with per-session protection and unresolved
+  failure protection. Provider sessions are never deleted.
+- Completion-based recovery metrics for automatic and manual recoveries.
+- Durable, idempotent manual-retry operations with explicit unknown outcomes
+  when a provider acknowledgement is lost or the service restarts.
+- Intel and Apple Silicon macOS preview archives with an explicit manual
+  Gatekeeper approval guide.
+
+### Changed
+
+- The CLI delegates status, session, watchlist, and policy operations to the
+  daemon when it is online, with the existing direct mode as an offline fallback.
+- Configuration, watchlist, and runtime-state schemas are version 3. Version 2
+  documents migrate automatically.
+- The CLI and service must be upgraded together. Version 3 configuration is not
+  readable by Watchcat 0.3.x.
+- The daemon control plane remains responsive while provider discovery or
+  recovery I/O is slow, and provider subprocesses restart after failure.
+- Session search advances with an opaque, bounded provider cursor; unresolved
+  recovery audits are retired after a bounded observation period.
+
+### Security
+
+- The daemon listens only on a current-user Unix socket whose directory is mode
+  `0700` and socket is mode `0600`, and rejects peers with another UID.
+- Service shutdown revokes recovery authority and cancels accepted work before
+  any queued provider send can begin.
+
 ## [0.3.1] - 2026-08-12
 
 ### Fixed

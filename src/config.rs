@@ -11,12 +11,17 @@ use crate::conditions::{CONDITIONS, DEFAULT_PROMPT, definition, is_known};
 use crate::models::{BackoffKind, PolicyAction};
 
 pub const DEFAULT_CONFIG: &str = r#"# Watchcat configuration
-version = 2
+version = 3
 
 [engine]
 poll_interval_seconds = 10
 attempt_window_seconds = 3600
 log_retention = 10000
+
+[lifecycle]
+stale_after_seconds = 259200
+sweep_interval_seconds = 60
+protect_unresolved_failures = true
 
 [providers.codex]
 enabled = true
@@ -24,11 +29,12 @@ command = ["codex", "app-server", "--listen", "stdio://"]
 
 "#;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub version: u32,
     pub engine: EngineSettings,
+    pub lifecycle: LifecycleSettings,
     pub providers: ProviderSettings,
     pub policies: BTreeMap<String, PolicyOverride>,
 }
@@ -36,10 +42,29 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             engine: EngineSettings::default(),
+            lifecycle: LifecycleSettings::default(),
             providers: ProviderSettings::default(),
             policies: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LifecycleSettings {
+    pub stale_after_seconds: i64,
+    pub sweep_interval_seconds: u64,
+    pub protect_unresolved_failures: bool,
+}
+
+impl Default for LifecycleSettings {
+    fn default() -> Self {
+        Self {
+            stale_after_seconds: 3 * 24 * 60 * 60,
+            sweep_interval_seconds: 60,
+            protect_unresolved_failures: true,
         }
     }
 }
@@ -89,7 +114,7 @@ impl Default for CodexSettings {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyOverride {
     pub action: Option<PolicyAction>,
@@ -100,7 +125,7 @@ pub struct PolicyOverride {
     pub prompt: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ResolvedPolicy {
     pub condition: String,
     pub description: String,
@@ -115,9 +140,9 @@ pub struct ResolvedPolicy {
 
 impl Settings {
     pub fn validate(&self) -> Result<()> {
-        if self.version != 2 {
+        if self.version != 3 {
             bail!(
-                "unsupported config version {}; this release supports version 2",
+                "unsupported config version {}; this release supports version 3",
                 self.version
             );
         }
@@ -126,6 +151,9 @@ impl Settings {
             || self.engine.log_retention == 0
         {
             bail!("engine settings must be positive");
+        }
+        if self.lifecycle.stale_after_seconds <= 0 || self.lifecycle.sweep_interval_seconds == 0 {
+            bail!("lifecycle settings must be positive");
         }
         validate_command(
             "providers.codex.command",
@@ -274,8 +302,11 @@ pub struct Paths {
     pub config_file: PathBuf,
     pub watchlist_file: PathBuf,
     pub state_file: PathBuf,
+    pub control_state_file: PathBuf,
     pub event_log_file: PathBuf,
+    pub retry_operations_file: PathBuf,
     pub lock_file: PathBuf,
+    pub socket_file: PathBuf,
 }
 
 impl Paths {
@@ -311,8 +342,11 @@ impl Paths {
             config_file,
             watchlist_file,
             state_file: state_dir.join("state.json"),
+            control_state_file: state_dir.join("control.json"),
             event_log_file: state_dir.join("events.jsonl"),
+            retry_operations_file: state_dir.join("retry-operations.json"),
             lock_file: state_dir.join("watchcat.lock"),
+            socket_file: state_dir.join("watchcat.sock"),
         })
     }
 }
@@ -333,9 +367,22 @@ pub fn load_settings(path: &Path) -> Result<Settings> {
     }
     let text = fs::read_to_string(path)
         .with_context(|| format!("cannot read configuration {}", path.display()))?;
-    let settings: Settings = toml::from_str(&text)
+    let mut document: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("invalid configuration {}", path.display()))?;
+    let version = document
+        .get("version")
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(2);
+    if version == 2 {
+        document["version"] = toml::Value::Integer(3);
+    }
+    let settings: Settings = document
+        .try_into()
         .with_context(|| format!("invalid configuration {}", path.display()))?;
     settings.validate()?;
+    if version == 2 {
+        save_settings(path, &settings)?;
+    }
     Ok(settings)
 }
 
@@ -352,9 +399,11 @@ pub fn display_settings(settings: &Settings) -> Result<String> {
     }
     let defaults: Settings = toml::from_str(DEFAULT_CONFIG)?;
     visible.engine = settings.engine.clone();
+    visible.lifecycle = settings.lifecycle.clone();
     visible.providers = settings.providers.clone();
     let mut text = toml::to_string_pretty(&visible)?;
     if visible.engine == defaults.engine
+        && visible.lifecycle == defaults.lifecycle
         && visible.providers.codex.enabled == defaults.providers.codex.enabled
         && visible.providers.codex.command == defaults.providers.codex.command
     {

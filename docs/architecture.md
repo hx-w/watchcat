@@ -1,104 +1,108 @@
 # Architecture
 
-Watchcat separates provider integration, failure classification, recovery
-policy, and observability. Provider-specific error names never control retry
-behavior directly.
+Watchcat 0.4 separates the long-running reliability service from its control
+surfaces.
 
 ```text
-CLI / service runner
-        |
-        v
-WatchEngine -------- WatchlistStore
-    |   |             RuntimeState
-    |   +-----------> EventLogStore (JSONL)
-    |   +-----------> condition policy / backoff / prompt rendering
-    |
-Provider contract
-    |
-    +---- CodexProvider ---- JSON-RPC stdio ---- codex app-server
-    |          |
-    |          +---- framed local IPC ---- Codex Desktop owner
-    |
-    +---- future session adapters
-
-Provider errors ---- classifier ---- condition ---- policy ---- action
+MenuBarExtra / full client            watchcat CLI
+              \                         /
+               \  protocol v1 JSON RPC /
+                +---- Unix socket -----+
+                           |
+                       watchcatd
+          +----------------+----------------+
+          |                |                |
+     WatchEngine      durable stores   event broadcast
+          |
+    provider contract
+          |
+    Codex App Server ---- Codex Desktop IPC owner
 ```
 
-## Conditions and policies
+## Ownership
 
-A provider adapter translates a structured upstream failure into a stable
-condition such as `network.stream_failed`, `capacity.model_overloaded`, or
-`capability.model_unavailable`. The engine resolves that condition through the
-user's policy. Providers do not decide whether to send a continuation.
+`watchcatd` is the only component that owns provider processes, recovery state,
+watchlist lifecycle, configuration revision, and event publication. A UI never
+implements recovery itself. The CLI uses the daemon when available and retains
+direct mode only for compatibility and diagnostics.
 
-The built-in defaults retry transient network, capacity, conflict, and server
-conditions. Authentication, billing, capability, context, quota, request,
-sandbox, and unknown conditions are skipped. Unknown input always fails closed.
+The daemon reconciles provider state periodically. Provider filesystem
+notifications reduce latency, but polling remains the correctness fallback.
+Configuration file modification time is checked every cycle. A valid change is
+atomically activated as a new revision; an invalid change is reported and the
+last good revision remains active.
 
-Each retry policy owns its action, backoff kind, initial and maximum delay,
-attempt limit, and prompt template. `retry_after_seconds` from a provider is a
-minimum delay and cannot shorten the configured backoff.
+## Local protocol
+
+RPC messages are UTF-8 JSON with a four-byte big-endian length prefix. Requests
+are limited to 1 MiB and responses to 8 MiB. Every request carries protocol
+version 1 and a request ID. Mutations may include `expected_revision`; a
+mismatch fails without applying the change. Session discovery uses an opaque
+provider cursor so activity-driven reordering cannot corrupt pagination.
+`events.subscribe` keeps one connection open for state and engine notifications
+and receives heartbeats during quiet periods.
+
+Manual retry is a short, idempotent accepted-operation request. The operation
+is persisted before acknowledgement, and a repeated client request recovers
+the same operation ID. The client then queries `retry_status` until the result
+is succeeded, failed, or explicitly unknown. Provider acknowledgement loss and
+daemon restart therefore never masquerade as an unsent retry.
+
+Provider calls run outside the control-plane lock. Local RPC connections and
+event subscriptions have separate bounded capacities, request frames have a
+read deadline, and sparse session searches scan a bounded number of provider
+pages per request. Service shutdown first revokes the recovery permit and then
+cancels queued accepted operations, so no new continuation starts after the
+stop signal.
+
+The macOS/Linux endpoint is a Unix domain socket in the native Watchcat state
+directory. The directory is mode `0700`, the socket is mode `0600`, and the
+accepted peer UID must match the daemon's effective UID. Windows named-pipe
+transport is deferred; direct CLI mode remains available there.
+
+## Conditions and recovery
+
+Providers translate structured errors into stable conditions such as
+`network.stream_failed`, `capacity.model_overloaded`, and
+`capability.model_unavailable`. Policy resolution, backoff, prompts, and attempt
+limits belong to the engine rather than the provider.
+
+A sent recovery becomes pending. It is counted as successful only when the
+provider reports the new turn as completed, and counted as failed only when that
+turn reports failure. In-progress or unknown state changes no metric. Pending
+recovery outcomes continue to be observed after their session leaves the
+watchlist; removal revokes future sends, not audit completion.
+An outcome that remains unavailable is eventually recorded as unconfirmed and
+removed from pending state without being counted as success or failure.
+
+## Session lifecycle
+
+The watchlist is an authorization list, not session storage. Each target keeps
+its addition time, latest observed activity, enabled state, and optional
+long-term protection. A stale sweep refreshes provider timestamps before
+removing entries. The sweep retains protected targets, unresolved failures, and
+all targets for a provider that could not be checked. It never deletes provider
+sessions or event history.
+
+## Storage
+
+Configuration, watchlist, and runtime state use schema version 3. Version 2
+documents migrate automatically. Files are replaced atomically. The bounded
+JSONL event log contains recovery decisions, failure text, and sent recovery
+prompts. Full provider messages are fetched on demand.
 
 ## Provider contract
 
-Each session adapter implements:
+Each adapter owns:
 
-1. `start()` and `close()` for resource ownership.
-2. `list_sessions()` for discovery.
-3. `session_logs()` for provider-native turns and messages.
-4. `latest_failure()` for normalized failure detection.
-5. `resume()` for one continuation turn.
-6. `send_message()` for explicit start-or-steer delivery.
-7. `interrupt()` for explicit active-turn cancellation when supported.
-8. `wait_for_change()` as an optional wakeup optimization.
+1. start and close;
+2. session discovery and logs;
+3. normalized latest-failure detection;
+4. recovery-turn outcome observation;
+5. resume, manual send, and interrupt;
+6. optional change notification.
 
-Claude Code's official `StopFailure` codes are normalized and tested in the
-shared classifier. This release does not include a Claude session adapter or
-claim that it can resume Claude sessions.
-
-## Recovery invariants
-
-- A session is mutable only when it appears in the explicit watchlist.
-- One failed turn is handled at most once.
-- Retry attempts are delayed and bounded per session and time window.
-- The latest failed turn is read again immediately before `resume()`.
-- A changed session cancels the pending continuation.
-- Automatic recovery never steers an active turn.
-- Dry-run mode never sends a prompt or marks a failure handled.
-- One watchdog process may own a state directory.
-- Provider and Watchcat events are retained as bounded JSONL history.
-
-## Codex adapter
-
-The adapter starts `codex app-server --listen stdio://`, initializes the
-JSON-RPC connection, and reads interactive Codex threads. `thread/read` supplies
-structured turns and message items for `session logs`.
-
-When Codex Desktop owns a thread, a second transport connects to its local IPC
-router and targets the owning Desktop client. Manual messages steer an active
-turn or start an idle turn. Automatic recovery only attempts a new turn; it
-never changes the instructions of already-running work. A missing Desktop owner
-falls back to `thread/resume` plus App Server `turn/start`; an incompatible or
-untrusted Desktop endpoint fails closed.
-
-Filesystem notifications reduce latency. Periodic reconciliation remains the
-correctness fallback for lost events, unsupported watch APIs, and restarts.
-
-## Storage contract
-
-Configuration, watchlist, and runtime-state documents use schema version 2.
-Watchcat 0.2 intentionally does not migrate version 1 files. Replace an old
-configuration with `watchcat config init --force`, then rebuild the watchlist.
-
-The event log is append-only JSONL with bounded compaction. It may contain
-failure messages and the exact continuation prompts Watchcat sent, but it does
-not copy full provider conversations. Provider messages are read on demand.
-
-## Threat model
-
-Watchcat assumes the local account already has authority to use watched agent
-sessions. It exposes no network listener and stores no provider credentials.
-The Codex Desktop transport validates the ownership and permissions of Unix IPC
-endpoints before connecting and uses only a fixed endpoint and fixed methods.
-Anyone who can edit the configuration, watchlist, or state directory should be
-treated as having equivalent local account access.
+Automatic recovery only starts a new turn. Manual send may steer an active
+Codex Desktop-owned turn through the local Desktop IPC router. The Desktop
+transport validates protocol version and endpoint ownership and fails closed on
+unknown compatibility.

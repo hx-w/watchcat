@@ -1,20 +1,30 @@
-# Running in the background
+# Running watchcatd in the background
 
-`watchcat run` is a foreground process by design. A platform service manager
-should own restarts and logs. Run `watchcat doctor` and
-`watchcat run --once --dry-run` successfully before enabling a service.
+Run `watchcat doctor` and a foreground `watchcatd --dry-run` before enabling a
+service. `watchcatd` owns restarts, provider connections, hot reload, and local
+RPC. The legacy `watchcat run` remains a direct foreground compatibility mode.
 
-## Linux with systemd user services
+## macOS app
 
-Create `~/.config/systemd/user/watchcat.service`:
+The native Watchcat app bundles `watchcatd` as an `SMAppService` LaunchAgent.
+Open Connection and choose Enable. macOS may require approval in System Settings
+under Login Items. The app can open that settings page directly.
+
+The bundled LaunchAgent uses `BundleProgram`, so it continues to resolve the
+helper inside the installed app after registration. Install the app in a stable
+location before enabling it.
+
+## Linux systemd user service
+
+Create `~/.config/systemd/user/watchcatd.service`:
 
 ```ini
 [Unit]
-Description=Watchcat session watchdog
+Description=Watchcat local reliability service
 After=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/watchcat run
+ExecStart=%h/.local/bin/watchcatd
 Restart=on-failure
 RestartSec=10
 
@@ -26,50 +36,9 @@ Then run:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now watchcat
-journalctl --user -u watchcat -f
+systemctl --user enable --now watchcatd
+journalctl --user -u watchcatd -f
 ```
 
-## macOS with launchd
-
-Create `~/Library/LaunchAgents/ai.watchcat.watchcat.plist`. Replace
-`/Users/YOU` with your home directory and use the path returned by
-`command -v watchcat`.
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>ai.watchcat.watchcat</string>
-  <key>ProgramArguments</key>
-  <array><string>/Users/YOU/.local/bin/watchcat</string><string>run</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/YOU/Library/Logs/watchcat.log</string>
-  <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/watchcat.log</string>
-</dict>
-</plist>
-```
-
-Load it with:
-
-```bash
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/ai.watchcat.watchcat.plist
-```
-
-## Windows with Task Scheduler
-
-In an unelevated PowerShell window, replace the executable path if needed:
-
-```powershell
-$action = New-ScheduledTaskAction -Execute "$env:LOCALAPPDATA\Programs\watchcat\bin\watchcat.exe" -Argument "run"
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$settings = New-ScheduledTaskSettingsSet -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName "Watchcat" -Action $action -Trigger $trigger -Settings $settings -Description "Watchcat session watchdog"
-Start-ScheduledTask -TaskName "Watchcat"
-```
-
-The watchlist remains the authorization boundary. Stopping a service does not
-remove sessions from it; use `watchcat watch remove SESSION_ID` to revoke a
-session.
+Stopping the service does not change the watchlist. Use
+`watchcat watch remove SESSION_ID` to revoke automatic recovery authority.

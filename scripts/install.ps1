@@ -26,7 +26,10 @@ if ($Version -eq "latest") {
 if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw "Invalid release version: $Version" }
 
 $archive = "watchcat-$target.zip"
-$baseUrl = "https://github.com/$Repository/releases/download/$Version"
+$baseUrl = if ($env:WATCHCAT_RELEASE_BASE_URL) { $env:WATCHCAT_RELEASE_BASE_URL } else { "https://github.com/$Repository/releases/download/$Version" }
+if ($baseUrl -notmatch '^https://' -and $baseUrl -notmatch '^http://(127\.0\.0\.1|localhost):') {
+    throw "Release base URL must use HTTPS (localhost HTTP is allowed for tests)."
+}
 $destination = Join-Path $InstallDir "watchcat.exe"
 if ($DryRun) {
     Write-Output "Would install $Version for $target to $destination"
@@ -51,9 +54,31 @@ try {
     Expand-Archive -Path $archivePath -DestinationPath $temporary
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $source = Join-Path $temporary "watchcat-$target\watchcat.exe"
-    $staged = Join-Path $InstallDir "watchcat.exe.tmp"
-    Copy-Item -Force $source $staged
-    Move-Item -Force $staged $destination
+    $staged = Join-Path $InstallDir (".watchcat." + [guid]::NewGuid() + ".tmp")
+    $backup = Join-Path $temporary "watchcat.exe.backup"
+    $hadExisting = Test-Path $destination
+    if ($hadExisting) { Copy-Item $destination $backup }
+    try {
+        Copy-Item $source $staged
+        Move-Item -Force $staged $destination
+        $actualVersion = & $destination --version
+        $expectedVersion = "watchcat " + $Version.Substring(1)
+        if ($actualVersion -ne $expectedVersion) {
+            throw "Expected '$expectedVersion', got '$actualVersion'"
+        }
+    }
+    catch {
+        if ($hadExisting -and (Test-Path $backup)) {
+            Copy-Item -Force $backup $destination
+        }
+        elseif (Test-Path $destination) {
+            Remove-Item -Force $destination
+        }
+        throw
+    }
+    finally {
+        Remove-Item -Force -ErrorAction SilentlyContinue $staged
+    }
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $entries = @($userPath -split ';' | Where-Object { $_ })
