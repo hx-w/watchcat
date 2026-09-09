@@ -58,7 +58,7 @@ Watchcat update.
 Run the following after updating either program:
 
 ```bash
-watchcat doctor
+watchcat service status
 watchcat session send SESSION_ID "Report current status" --json
 ```
 

@@ -1,14 +1,9 @@
-use std::collections::HashMap;
-use std::path::Path;
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tracing::debug;
-use uuid::Uuid;
 
 use crate::config::CodexSettings;
 use crate::models::{
@@ -17,28 +12,14 @@ use crate::models::{
 };
 use crate::providers::{Provider, SessionSearchPage};
 use crate::transport::codex_desktop::{CodexDesktopIpc, DesktopMessageDelivery};
-use crate::transport::jsonrpc::{JsonRpcClient, JsonRpcError};
+use crate::transport::jsonrpc::JsonRpcClient;
 
-const SOURCE_KINDS: &[&str] = &[
-    "cli",
-    "vscode",
-    "exec",
-    "appServer",
-    "subAgent",
-    "subAgentReview",
-    "subAgentCompact",
-    "subAgentThreadSpawn",
-    "subAgentOther",
-    "unknown",
-];
+const SOURCE_KINDS: &[&str] = &["cli", "vscode", "exec", "appServer", "unknown"];
 const MAX_SEARCH_PAGES_PER_REQUEST: usize = 5;
 
 pub struct CodexProvider {
     client: JsonRpcClient,
     started: bool,
-    sessions: HashMap<String, Session>,
-    watches: HashMap<String, String>,
-    watch_supported: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -52,9 +33,6 @@ impl CodexProvider {
         Ok(Self {
             client: JsonRpcClient::new(settings.command.clone())?,
             started: false,
-            sessions: HashMap::new(),
-            watches: HashMap::new(),
-            watch_supported: true,
         })
     }
 
@@ -63,55 +41,7 @@ impl CodexProvider {
             return Ok(());
         }
         self.started = false;
-        self.watches.clear();
-        self.sessions.clear();
         self.start().await
-    }
-
-    async fn ensure_watches(&mut self, session_ids: &[String]) -> Result<()> {
-        if session_ids
-            .iter()
-            .any(|session_id| !self.sessions.contains_key(session_id))
-        {
-            let _ = self.list_sessions(500).await?;
-        }
-        for session_id in session_ids {
-            if self.watches.contains_key(session_id) {
-                continue;
-            }
-            let Some(path) = self
-                .sessions
-                .get(session_id)
-                .and_then(|session| session.metadata.get("path"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            if !Path::new(path).is_absolute() {
-                continue;
-            }
-            let watch_id = Uuid::new_v5(
-                &Uuid::NAMESPACE_URL,
-                format!("watchcat:codex:{session_id}").as_bytes(),
-            )
-            .to_string();
-            match self
-                .client
-                .request("fs/watch", json!({"watchId": watch_id, "path": path}))
-                .await
-            {
-                Ok(_) => {
-                    self.watches.insert(session_id.clone(), watch_id);
-                }
-                Err(error) => {
-                    debug!(%error, "Codex fs/watch unavailable; using polling");
-                    self.watch_supported = false;
-                    self.watches.clear();
-                    break;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -145,20 +75,7 @@ impl Provider for CodexProvider {
         if !self.started {
             return Ok(());
         }
-        if self.watch_supported {
-            for watch_id in self.watches.values() {
-                if self
-                    .client
-                    .request("fs/unwatch", json!({"watchId": watch_id}))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
         self.client.close().await?;
-        self.watches.clear();
         self.started = false;
         Ok(())
     }
@@ -190,7 +107,6 @@ impl Provider for CodexProvider {
             }
             for raw in data {
                 let session = parse_session(raw)?;
-                self.sessions.insert(session.id.clone(), session.clone());
                 sessions.push(session);
             }
             cursor = page
@@ -263,7 +179,6 @@ impl Provider for CodexProvider {
             let mut page_matches = Vec::new();
             for raw in data {
                 let session = parse_session(raw)?;
-                self.sessions.insert(session.id.clone(), session.clone());
                 if needle.is_empty()
                     || session.title.to_ascii_lowercase().contains(&needle)
                     || session.id.to_ascii_lowercase().contains(&needle)
@@ -332,28 +247,11 @@ impl Provider for CodexProvider {
                 }),
             )
             .await;
-        let turn = match result {
-            Ok(page) => page
-                .get("data")
-                .and_then(Value::as_array)
-                .and_then(|turns| turns.first())
-                .cloned(),
-            Err(error) if is_unsupported_method(&error) => {
-                let result = self
-                    .client
-                    .request(
-                        "thread/read",
-                        json!({"threadId": session_id, "includeTurns": true}),
-                    )
-                    .await?;
-                result
-                    .pointer("/thread/turns")
-                    .and_then(Value::as_array)
-                    .and_then(|turns| turns.last())
-                    .cloned()
-            }
-            Err(error) => return Err(error),
-        };
+        let page = result?;
+        let turn = page
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|turns| turns.first());
         let Some(turn) = turn else {
             return Ok(None);
         };
@@ -533,50 +431,6 @@ impl Provider for CodexProvider {
             transport: MessageTransport::AppServer,
         })
     }
-
-    async fn wait_for_change(
-        &mut self,
-        session_ids: &[String],
-        timeout: Duration,
-    ) -> Result<Vec<String>> {
-        self.ensure_started().await?;
-        if session_ids.is_empty() {
-            tokio::time::sleep(timeout).await;
-            return Ok(Vec::new());
-        }
-        if self.watch_supported {
-            self.ensure_watches(session_ids).await?;
-        }
-        if !self.watch_supported {
-            tokio::time::sleep(timeout).await;
-            return Ok(session_ids.to_vec());
-        }
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(session_ids.to_vec());
-            }
-            let Some(notification) = self.client.next_notification(remaining).await? else {
-                return Ok(session_ids.to_vec());
-            };
-            if notification.get("method").and_then(Value::as_str) != Some("fs/changed") {
-                continue;
-            }
-            let watch_id = notification
-                .pointer("/params/watchId")
-                .and_then(Value::as_str);
-            let changed = self
-                .watches
-                .iter()
-                .filter(|(_, registered)| Some(registered.as_str()) == watch_id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect::<Vec<_>>();
-            if !changed.is_empty() {
-                return Ok(changed);
-            }
-        }
-    }
 }
 
 impl CodexProvider {
@@ -603,7 +457,7 @@ impl CodexProvider {
     }
 
     async fn active_turn_id(&mut self, session_id: &str) -> Result<Option<String>> {
-        let result = match self
+        let result = self
             .client
             .request(
                 "thread/turns/list",
@@ -614,29 +468,11 @@ impl CodexProvider {
                     "itemsView": "notLoaded",
                 }),
             )
-            .await
-        {
-            Ok(result) => result,
-            Err(error) if is_unsupported_method(&error) => {
-                self.client
-                    .request(
-                        "thread/read",
-                        json!({"threadId": session_id, "includeTurns": true}),
-                    )
-                    .await?
-            }
-            Err(error) => return Err(error),
-        };
+            .await?;
         let turn = result
             .get("data")
             .and_then(Value::as_array)
-            .and_then(|turns| turns.first())
-            .or_else(|| {
-                result
-                    .pointer("/thread/turns")
-                    .and_then(Value::as_array)
-                    .and_then(|turns| turns.last())
-            });
+            .and_then(|turns| turns.first());
         Ok(turn
             .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
             .and_then(|turn| turn.get("id").and_then(Value::as_str))
@@ -708,21 +544,7 @@ pub struct ClassifiedError {
 }
 
 pub fn classify_codex_error(error: &Value) -> ClassifiedError {
-    let mut code = codex_error_code(error.get("codexErrorInfo"));
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if code == "Other" {
-        code = if message.contains("too many failed attempts") {
-            "ResponseTooManyFailedAttempts".into()
-        } else if message.contains("stream disconnected") {
-            "ResponseStreamDisconnected".into()
-        } else {
-            code
-        };
-    }
+    let code = codex_error_code(error.get("codexErrorInfo"));
     let status = http_status(error.get("codexErrorInfo"));
     let (condition, scope) = match code.as_str() {
         "ContextWindowExceeded" => ("context.window_exceeded", None),
@@ -760,11 +582,6 @@ fn codex_error_code(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(code)) => canonical_error_code(code),
         Some(Value::Object(object)) => {
-            for key in ["type", "kind", "code"] {
-                if let Some(code) = object.get(key).and_then(Value::as_str) {
-                    return canonical_error_code(code);
-                }
-            }
             let known = object
                 .keys()
                 .map(|key| canonical_error_code(key))
@@ -782,22 +599,16 @@ fn codex_error_code(value: Option<&Value>) -> String {
 
 fn canonical_error_code(code: &str) -> String {
     match code {
-        "httpConnectionFailed" | "HttpConnectionFailed" => "HttpConnectionFailed".into(),
-        "responseStreamConnectionFailed" | "ResponseStreamConnectionFailed" => {
-            "ResponseStreamConnectionFailed".into()
-        }
-        "responseStreamDisconnected" | "ResponseStreamDisconnected" => {
-            "ResponseStreamDisconnected".into()
-        }
-        "responseTooManyFailedAttempts" | "ResponseTooManyFailedAttempts" => {
-            "ResponseTooManyFailedAttempts".into()
-        }
-        "contextWindowExceeded" | "ContextWindowExceeded" => "ContextWindowExceeded".into(),
-        "usageLimitExceeded" | "UsageLimitExceeded" => "UsageLimitExceeded".into(),
-        "badRequest" | "BadRequest" => "BadRequest".into(),
-        "unauthorized" | "Unauthorized" => "Unauthorized".into(),
-        "sandboxError" | "SandboxError" => "SandboxError".into(),
-        "internalServerError" | "InternalServerError" => "InternalServerError".into(),
+        "httpConnectionFailed" => "HttpConnectionFailed".into(),
+        "responseStreamConnectionFailed" => "ResponseStreamConnectionFailed".into(),
+        "responseStreamDisconnected" => "ResponseStreamDisconnected".into(),
+        "responseTooManyFailedAttempts" => "ResponseTooManyFailedAttempts".into(),
+        "contextWindowExceeded" => "ContextWindowExceeded".into(),
+        "usageLimitExceeded" => "UsageLimitExceeded".into(),
+        "badRequest" => "BadRequest".into(),
+        "unauthorized" => "Unauthorized".into(),
+        "sandboxError" => "SandboxError".into(),
+        "internalServerError" => "InternalServerError".into(),
         _ => "Other".into(),
     }
 }
@@ -965,12 +776,6 @@ fn parse_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
     }
 }
 
-fn is_unsupported_method(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<JsonRpcError>()
-        .is_some_and(|error| matches!(error.code, -32601 | -32602))
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -1091,22 +896,11 @@ done
     }
 
     #[test]
-    fn accepts_legacy_pascal_case_structured_code() {
-        let classified = classify_codex_error(&json!({
-            "message": "failed",
-            "codexErrorInfo": {"type": "ResponseStreamConnectionFailed"}
-        }));
-        assert_eq!(classified.provider_code, "ResponseStreamConnectionFailed");
-        assert_eq!(classified.condition, "network.stream_failed");
-    }
-
-    #[test]
-    fn recognizes_legacy_disconnect_message() {
+    fn unstructured_disconnect_message_does_not_authorize_recovery() {
         let classified = classify_codex_error(&json!({
             "message": "stream disconnected before completion: error sending request"
         }));
-        assert_eq!(classified.provider_code, "ResponseStreamDisconnected");
-        assert_eq!(classified.condition, "network.stream_failed");
+        assert_eq!(classified.condition, "failure.unknown");
     }
 
     #[test]
@@ -1120,13 +914,13 @@ done
     fn maps_overload_and_usage_limit_distinctly() {
         let overload = classify_codex_error(&json!({
             "message": "overloaded",
-            "codexErrorInfo": {"type": "HttpConnectionFailed", "httpStatusCode": 529}
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 529}}
         }));
         assert_eq!(overload.condition, "capacity.service_overloaded");
         assert_eq!(overload.scope.as_deref(), Some("service"));
         let quota = classify_codex_error(&json!({
             "message": "usage exhausted",
-            "codexErrorInfo": {"type": "UsageLimitExceeded"}
+            "codexErrorInfo": "usageLimitExceeded"
         }));
         assert_eq!(quota.condition, "quota.usage_exhausted");
     }

@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+#[cfg(test)]
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::config::Settings;
 use crate::models::{
@@ -39,37 +40,31 @@ pub struct RecoveryPermit {
 
 #[derive(Default)]
 struct RecoveryPermitState {
-    guard_enabled: bool,
+    running: bool,
     target_keys: HashSet<String>,
     generation: u64,
 }
 
 impl RecoveryPermit {
-    pub fn new(guard_enabled: bool, targets: &[WatchTarget], generation: u64) -> Self {
+    pub fn new(running: bool, targets: &[WatchTarget], generation: u64) -> Self {
         let permit = Self::default();
-        permit.update(guard_enabled, targets, generation);
+        permit.update(running, targets, generation);
         permit
     }
 
-    pub fn update(&self, guard_enabled: bool, targets: &[WatchTarget], generation: u64) {
+    pub fn update(&self, running: bool, targets: &[WatchTarget], generation: u64) {
         let mut state = self
             .state
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        state.guard_enabled = guard_enabled;
-        state.target_keys = targets
-            .iter()
-            .filter(|target| target.enabled)
-            .map(WatchTarget::key)
-            .collect();
+        state.running = running;
+        state.target_keys = targets.iter().map(WatchTarget::key).collect();
         state.generation = generation;
     }
 
     fn allows(&self, target: &WatchTarget, generation: u64) -> bool {
         let state = self.state.read().unwrap_or_else(|error| error.into_inner());
-        state.guard_enabled
-            && state.generation == generation
-            && state.target_keys.contains(&target.key())
+        state.running && state.generation == generation && state.target_keys.contains(&target.key())
     }
 
     pub fn generation(&self) -> u64 {
@@ -117,10 +112,7 @@ impl WatchEngine {
         Self {
             settings,
             providers,
-            targets: targets
-                .into_iter()
-                .filter(|target| target.enabled)
-                .collect(),
+            targets: targets.into_iter().collect(),
             state,
             event_log,
             unresolved_targets: HashSet::new(),
@@ -265,7 +257,7 @@ impl WatchEngine {
                     now,
                     "retry.cancelled",
                     &target,
-                    "guard state changed before resume; no message sent".into(),
+                    "session authorization changed before resume; no message sent".into(),
                     Some(failure),
                 ));
                 continue;
@@ -276,7 +268,7 @@ impl WatchEngine {
                     now,
                     "retry.cancelled",
                     &target,
-                    "guard state changed before resume; no message sent".into(),
+                    "session authorization changed before resume; no message sent".into(),
                     Some(failure),
                 ));
                 continue;
@@ -298,7 +290,7 @@ impl WatchEngine {
                     now,
                     "retry.cancelled",
                     &target,
-                    "guard state changed before resume; no message sent".into(),
+                    "session authorization changed before resume; no message sent".into(),
                     Some(failure),
                 ));
                 continue;
@@ -500,59 +492,6 @@ impl WatchEngine {
                 }))
     }
 
-    pub async fn run_forever_with<F>(&mut self, mut reload: F) -> Result<()>
-    where
-        F: FnMut() -> Result<(Option<Vec<WatchTarget>>, Option<Settings>, bool)>,
-    {
-        loop {
-            let (targets, settings, guard_enabled) = reload()?;
-            self.apply_direct_reload(targets, settings, guard_enabled)
-                .await;
-            for event in self.run_once(Utc::now()).await? {
-                if event.kind.ends_with("error") || event.kind.ends_with("failed") {
-                    warn!(
-                        kind = event.kind,
-                        target = event.target,
-                        "{}",
-                        event.message
-                    );
-                } else {
-                    info!(
-                        kind = event.kind,
-                        target = event.target,
-                        "{}",
-                        event.message
-                    );
-                }
-            }
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    result?;
-                    break;
-                }
-                _ = self.wait_for_change() => {}
-            }
-        }
-        Ok(())
-    }
-
-    async fn apply_direct_reload(
-        &mut self,
-        targets: Option<Vec<WatchTarget>>,
-        settings: Option<Settings>,
-        guard_enabled: bool,
-    ) {
-        if let Some(targets) = targets {
-            let generation = self.recovery_permit.generation();
-            self.recovery_permit
-                .update(guard_enabled, &targets, generation);
-            self.replace_targets(targets);
-        }
-        if let Some(settings) = settings {
-            self.replace_settings(settings).await;
-        }
-    }
-
     pub async fn close(&mut self) {
         for provider in self.providers.values_mut() {
             if let Err(error) = provider.close().await {
@@ -566,31 +505,12 @@ impl WatchEngine {
     }
 
     pub async fn replace_settings(&mut self, settings: Settings) {
-        if self.settings.providers.codex != settings.providers.codex {
-            if let Some(mut provider) = self.providers.remove("codex") {
-                if let Err(error) = provider.close().await {
-                    warn!(%error, "failed to close Codex provider during hot reload");
-                }
-            }
+        if self.settings.providers != settings.providers {
+            self.close().await;
+            self.providers.clear();
         }
         self.event_log.set_retention(settings.engine.log_retention);
         self.settings = settings;
-    }
-
-    pub fn guard_state(&self) -> (bool, Option<DateTime<Utc>>) {
-        self.state.guard_state()
-    }
-
-    pub fn set_guard_state(
-        &mut self,
-        enabled: bool,
-        paused_until: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        self.state.set_guard_state(enabled, paused_until)
-    }
-
-    pub fn next_revision(&mut self) -> Result<u64> {
-        self.state.next_revision()
     }
 
     pub fn replace_watch_targets(&mut self, targets: Vec<WatchTarget>) {
@@ -654,6 +574,18 @@ impl WatchEngine {
         Ok(events)
     }
 
+    pub async fn recent_sessions(
+        &mut self,
+        provider: &str,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<Session>> {
+        self.providers
+            .get_mut(provider)
+            .ok_or_else(|| anyhow!("provider is unavailable: {provider}"))?
+            .recent_sessions(cutoff)
+            .await
+    }
+
     pub async fn validate_session(&mut self, provider: &str, session_id: &str) -> Result<()> {
         self.providers
             .get_mut(provider)
@@ -714,10 +646,10 @@ impl WatchEngine {
             .find(|target| target.provider == provider_name && target.session_id == session_id)
             .cloned()
             .with_context(|| {
-                format!("session {provider_name}:{session_id} is not being guarded")
+                format!("session {provider_name}:{session_id} is not being watched")
             })?;
         if !self.recovery_permit.allows(&target, generation) {
-            bail!("guard state changed before the manual retry could start");
+            bail!("session authorization changed before the manual retry could start");
         }
         let failure = self
             .providers
@@ -747,7 +679,7 @@ impl WatchEngine {
         let prompt = render_prompt(&policy.prompt, &failure, attempts + 1, policy.max_attempts);
         let _send_boundary = self.recovery_permit.enter_send_boundary().await;
         if !self.recovery_permit.allows(&target, generation) {
-            bail!("guard state changed before the manual retry was sent");
+            bail!("session authorization changed before the manual retry was sent");
         }
         self.state.record_attempt(&target, now);
         self.state.save()?;
@@ -823,34 +755,8 @@ impl WatchEngine {
         targets
     }
 
-    async fn wait_for_change(&mut self) {
-        let mut sessions = HashMap::<String, Vec<String>>::new();
-        for target in &self.targets {
-            sessions
-                .entry(target.provider.clone())
-                .or_default()
-                .push(target.session_id.clone());
-        }
-        let timeout = StdDuration::from_secs(self.settings.engine.poll_interval_seconds);
-        if sessions.is_empty() {
-            tokio::time::sleep(timeout).await;
-            return;
-        }
-        for (name, provider) in &mut self.providers {
-            let Some(session_ids) = sessions.get(name) else {
-                continue;
-            };
-            if let Err(error) = provider.wait_for_change(session_ids, timeout).await {
-                warn!(%error, "provider change watcher failed; reconciliation will continue");
-            }
-        }
-    }
-
     fn replace_targets(&mut self, targets: Vec<WatchTarget>) {
-        self.targets = targets
-            .into_iter()
-            .filter(|target| target.enabled)
-            .collect();
+        self.targets = targets.into_iter().collect();
         let active = self
             .targets
             .iter()
@@ -1001,13 +907,13 @@ mod tests {
 
     fn target() -> WatchTarget {
         WatchTarget {
+            source: crate::models::TrackingSource::Manual,
             provider: "fake".into(),
             session_id: "session".into(),
-            enabled: true,
-            protected: false,
             label: None,
+            title: None,
             added_at: Utc::now(),
-            last_event_at: None,
+            last_activity_at: None,
         }
     }
 
@@ -1042,7 +948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_retry_requires_current_guard_authorization() {
+    async fn manual_retry_requires_current_session_authorization() {
         let (mut engine, resumes) = engine(vec![Some(failure("network.timeout"))], false);
         let generation = engine.recovery_permit.generation();
         engine.recovery_permit.update(false, &[], generation + 1);
@@ -1052,30 +958,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("guard state changed"));
+        assert!(error.to_string().contains("session authorization changed"));
         assert!(resumes.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn direct_reload_authorizes_a_newly_watched_session() {
-        let current = failure("network.timeout");
-        let (mut engine, resumes) = engine(
-            vec![Some(current.clone()), Some(current.clone()), Some(current)],
-            false,
-        );
-        engine.replace_watch_targets(Vec::new());
-        engine.recovery_permit.update(true, &[], 0);
-        engine
-            .apply_direct_reload(Some(vec![target()]), None, true)
-            .await;
-
-        let now = Utc::now();
-        assert_eq!(engine.run_once(now).await.unwrap()[0].kind, "retry.waiting");
-        assert_eq!(
-            engine.run_once(now + Duration::seconds(10)).await.unwrap()[0].kind,
-            "retry.sent"
-        );
-        assert_eq!(resumes.lock().unwrap().len(), 1);
     }
 
     fn engine_with_outcomes(

@@ -1,6 +1,6 @@
 [package]
 name = "watchcat"
-version = "0.4.0"
+version = "0.5.0"
 default-run = "watchcat"
 edition = "2024"
 rust-version = "1.85"
@@ -29,7 +29,7 @@ tokio = { version = "1.47", features = ["macros", "net", "process", "rt-multi-th
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1.18", features = ["v4", "v5"] }
+uuid = { version = "1.18", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

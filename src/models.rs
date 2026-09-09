@@ -123,28 +123,38 @@ pub struct InterruptReceipt {
     pub transport: MessageTransport,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingSource {
+    Automatic,
+    Manual,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WatchTarget {
+    pub source: TrackingSource,
     pub provider: String,
     pub session_id: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub protected: bool,
     pub label: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     pub added_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_event_at: Option<DateTime<Utc>>,
+    pub last_activity_at: Option<DateTime<Utc>>,
 }
 
 impl WatchTarget {
+    pub fn inactivity_since(&self, observed: Option<DateTime<Utc>>) -> DateTime<Utc> {
+        let activity = observed.max(self.last_activity_at).unwrap_or(self.added_at);
+        match self.source {
+            TrackingSource::Automatic => activity,
+            TrackingSource::Manual => activity.max(self.added_at),
+        }
+    }
+
     pub fn key(&self) -> String {
         format!("{}:{}", self.provider, self.session_id)
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::config::PolicyOverride;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ACTIVITY_ITEMS: usize = 500;
 
@@ -71,6 +71,14 @@ pub struct SessionRef {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManagedSessionQuery {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default = "default_session_limit")]
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RetryRequest {
     #[serde(flatten)]
     pub session: SessionRef,
@@ -85,25 +93,13 @@ pub struct SessionMessage {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WatchAdd {
+pub struct SessionAdd {
     #[serde(flatten)]
     pub session: SessionRef,
     #[serde(default)]
     pub label: Option<String>,
-    #[serde(default)]
-    pub protected: bool,
     #[serde(default = "default_true")]
     pub validate: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WatchUpdate {
-    #[serde(flatten)]
-    pub session: SessionRef,
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub protected: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -132,11 +128,7 @@ pub struct Snapshot {
     pub generated_at: DateTime<Utc>,
     pub revision: u64,
     pub service_online: bool,
-    pub guard_enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub guard_paused_until: Option<DateTime<Utc>>,
     pub watched: usize,
-    pub paused: usize,
     pub attention: usize,
     pub attention_target_keys: Vec<String>,
     pub automatic_recoveries: usize,

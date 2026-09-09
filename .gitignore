@@ -1,4 +1,3 @@
 target/
-clients/macos/.build/
 dist/
 .DS_Store

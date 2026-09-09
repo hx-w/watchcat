@@ -2,7 +2,39 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.0] - 2026-09-09
+
+### Removed
+
+- Native macOS client, Swift package, app bundling, and preview release archives.
+- Direct CLI execution, `watchcat run`, and the engine's second polling loop.
+  All runtime commands now require the background server.
+- Legacy RPC aliases, automatic v2 config/state migration, and duplicate guard
+  state in the recovery engine. Unsupported schemas fail without being rewritten.
+- Unused provider filesystem watches, notification queues, and UUID v5 support.
+- Legacy Codex method/error shapes and unstructured error-message retry heuristics.
+- Windows CLI-only releases and installer; macOS/Linux ship CLI and server together.
+
+### Added
+
+- `watchcat service install/start/stop/restart/status/uninstall` for launchd and
+  systemd user services, with a dry-run registration preview.
+- Automatic recent-session discovery for Codex and Claude Code, including an empty list.
+- Claude native transcript discovery and logs, with incremental append parsing.
+- Durable manual exclusions and automatic expiry/reactivation based on provider activity.
+
+### Changed
+
+- CLI groups are `service`, `session`, and `config`; policy commands are under
+  `config policy`, and session add/remove replace the separate watch commands.
+- Removed guard, individual pause/protection, and unresolved-failure expiry exemptions.
+- Config/watchlist schemas are 4, control state and RPC are 2; no compatibility aliases.
+
+- CI and release packaging only build Rust binaries. Release notes describe
+  the current CLI/service package instead of reusing the 0.4.0 app announcement.
+- Runtime control state has one owner: the server. The CLI only manages local
+  configuration files and OS service registration, and sends runtime RPC requests.
+- See README for the explicit backup/reset procedure for unsupported schemas.
 
 ## [0.4.0] - 2026-08-13
 

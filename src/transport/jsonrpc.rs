@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -30,8 +30,6 @@ pub struct JsonRpcClient {
     child: Option<Child>,
     stdin: Option<Arc<Mutex<ChildStdin>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
-    notifications_tx: broadcast::Sender<Value>,
-    notifications_rx: broadcast::Receiver<Value>,
     reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
     next_id: AtomicU64,
@@ -47,15 +45,12 @@ impl JsonRpcClient {
             .unwrap_or_else(|| PathBuf::from(&command[0]))
             .to_string_lossy()
             .into_owned();
-        let (notifications_tx, notifications_rx) = broadcast::channel(256);
         Ok(Self {
             command,
             timeout: Duration::from_secs(30),
             child: None,
             stdin: None,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            notifications_tx,
-            notifications_rx,
             reader: None,
             stderr_reader: None,
             next_id: AtomicU64::new(1),
@@ -94,7 +89,6 @@ impl JsonRpcClient {
         self.stdin = Some(Arc::new(Mutex::new(stdin)));
 
         let pending = Arc::clone(&self.pending);
-        let notifications = self.notifications_tx.clone();
         self.reader = Some(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
@@ -108,9 +102,8 @@ impl JsonRpcClient {
                             }
                         };
                         if message.get("method").and_then(Value::as_str).is_some() {
-                            if notifications.send(message).is_err() {
-                                break;
-                            }
+                            // Recovery observes provider state through server polling.
+                            continue;
                         } else if let Some(id) = message.get("id").and_then(Value::as_u64) {
                             if let Some(sender) = pending.lock().await.remove(&id) {
                                 let result = if let Some(error) = message.get("error") {
@@ -200,23 +193,6 @@ impl JsonRpcClient {
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.send(&json!({"method": method, "params": params}))
             .await
-    }
-
-    pub async fn next_notification(&mut self, timeout: Duration) -> Result<Option<Value>> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(None);
-            }
-            match tokio::time::timeout(remaining, self.notifications_rx.recv()).await {
-                Ok(Ok(value)) => return Ok(Some(value)),
-                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
-                    warn!(skipped, "app-server notifications lagged");
-                }
-                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return Ok(None),
-            }
-        }
     }
 
     pub async fn close(&mut self) -> Result<()> {

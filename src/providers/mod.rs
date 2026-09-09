@@ -2,7 +2,6 @@ mod claude;
 mod codex;
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -11,10 +10,15 @@ use crate::models::{
     Failure, InterruptReceipt, MessageReceipt, ResumeReceipt, Session, SessionLog, TurnOutcome,
 };
 
-pub use claude::{classify_claude_error, classify_claude_hook};
+pub use claude::{ClaudeProvider, classify_claude_error, classify_claude_hook};
 pub use codex::{CodexProvider, classify_codex_error};
 
 use crate::config::Settings;
+
+/// Capabilities exposed by the current adapters, independent of installation state.
+pub fn supports_recovery(provider: &str) -> bool {
+    provider == "codex"
+}
 
 pub fn build_providers<'a>(
     settings: &Settings,
@@ -33,9 +37,10 @@ pub fn build_providers<'a>(
                 );
             }
             "codex" => bail!("provider is disabled: codex"),
-            "claude" => bail!(
-                "Claude error definitions are available, but the Claude session adapter is not enabled in this release"
-            ),
+            "claude" if settings.providers.claude.enabled => {
+                providers.insert(name.into(), Box::new(ClaudeProvider::new()?));
+            }
+            "claude" => bail!("provider is disabled: claude"),
             _ => bail!("unknown provider: {name}"),
         }
     }
@@ -61,6 +66,34 @@ pub trait Provider: Send {
     async fn start(&mut self) -> Result<()>;
     async fn close(&mut self) -> Result<()>;
     async fn list_sessions(&mut self, limit: usize) -> Result<Vec<Session>>;
+    async fn recent_sessions(
+        &mut self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Session>> {
+        let mut sessions = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = self.search_sessions("", cursor.as_deref(), 500).await?;
+            let reached_cutoff = page
+                .sessions
+                .iter()
+                .any(|s| s.updated_at.is_some_and(|t| t < cutoff));
+            sessions.extend(page.sessions);
+            if reached_cutoff {
+                break;
+            }
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            if !seen.insert(next.clone()) {
+                bail!("{} repeated a discovery cursor", self.name());
+            }
+            cursor = Some(next);
+        }
+        Ok(sessions)
+    }
+    /// Return sessions newest-first by provider activity; cursors must advance.
     async fn search_sessions(
         &mut self,
         query: &str,
@@ -97,14 +130,5 @@ pub trait Provider: Send {
             delivery: crate::models::MessageDelivery::Started,
             transport: receipt.transport,
         })
-    }
-
-    async fn wait_for_change(
-        &mut self,
-        session_ids: &[String],
-        timeout: Duration,
-    ) -> Result<Vec<String>> {
-        tokio::time::sleep(timeout).await;
-        Ok(session_ids.to_vec())
     }
 }

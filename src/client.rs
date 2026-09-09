@@ -38,7 +38,7 @@ impl WatchcatClient {
         .context("timed out connecting to Watchcat service")?
         .with_context(|| {
             format!(
-                "cannot connect to Watchcat service at {}",
+                "cannot connect to Watchcat service at {}; start it with `watchcat service start` or `watchcatd`",
                 self.socket_path.display()
             )
         })?;

@@ -21,8 +21,8 @@ use crate::engine::{RecoveryPermit, WatchEngine};
 use crate::models::{EngineEvent, WatchTarget};
 use crate::protocol::{
     ActivityQuery, MAX_FRAME_BYTES, PROTOCOL_VERSION, PolicyUpdate, RetryRequest, RpcError,
-    RpcNotification, RpcRequest, RpcResponse, SessionMessage, SessionQuery, SessionRef, Snapshot,
-    WatchAdd, WatchUpdate,
+    RpcNotification, RpcRequest, RpcResponse, SessionAdd, SessionMessage, SessionQuery, SessionRef,
+    Snapshot,
 };
 use crate::providers::{build_providers, start_providers};
 use crate::state::{ControlStateStore, EventLogStore, ProcessLock, RuntimeState, WatchlistStore};
@@ -48,15 +48,13 @@ impl Drop for SocketCleanup {
 struct ReconcilePlan {
     now: chrono::DateTime<Utc>,
     revision: u64,
-    guard_enabled: bool,
     targets: Vec<WatchTarget>,
     settings: crate::config::Settings,
-    refresh_lifecycle: bool,
 }
 
 struct ReconcileOutcome {
     events: Vec<EngineEvent>,
-    session_activity: Vec<(String, String, chrono::DateTime<Utc>)>,
+    sessions: Vec<crate::models::Session>,
     lifecycle_protected: HashSet<String>,
 }
 
@@ -293,7 +291,6 @@ pub struct WatchcatDaemon {
     recovery_permit: RecoveryPermit,
     attention_target_keys: Vec<String>,
     metrics: crate::state::RecoveryMetrics,
-    last_sweep_at: Option<chrono::DateTime<Utc>>,
 }
 
 impl WatchcatDaemon {
@@ -310,16 +307,8 @@ impl WatchcatDaemon {
         let mut attention_target_keys = state.pending_target_keys().into_iter().collect::<Vec<_>>();
         attention_target_keys.sort();
         let metrics = state.metrics_since(month_start);
-        let control_state = ControlStateStore::load(
-            paths.control_state_file.clone(),
-            state.guard_state(),
-            state.revision(),
-        )?;
-        let recovery_permit = RecoveryPermit::new(
-            control_state.guard_state().0,
-            &targets,
-            control_state.revision(),
-        );
+        let control_state = ControlStateStore::load(paths.control_state_file.clone())?;
+        let recovery_permit = RecoveryPermit::new(true, &targets, control_state.revision());
         let event_log =
             EventLogStore::new(paths.event_log_file.clone(), settings.engine.log_retention);
         let config_modified = modified_time(&paths.config_file);
@@ -333,7 +322,6 @@ impl WatchcatDaemon {
             recovery_permit,
             attention_target_keys,
             metrics,
-            last_sweep_at: None,
         })
     }
 
@@ -341,25 +329,8 @@ impl WatchcatDaemon {
         self.control_state.revision()
     }
 
-    fn guard_state(&self) -> (bool, Option<chrono::DateTime<Utc>>) {
-        self.control_state.guard_state()
-    }
-
     fn update_recovery_permit(&self, targets: &[WatchTarget]) {
-        self.recovery_permit
-            .update(self.guard_state().0, targets, self.revision());
-    }
-
-    fn update_guard(
-        &mut self,
-        enabled: bool,
-        paused_until: Option<chrono::DateTime<Utc>>,
-    ) -> Result<()> {
-        let targets = self.watchlist.list()?;
-        self.control_state
-            .set_guard_state_and_advance(enabled, paused_until)?;
-        self.update_recovery_permit(&targets);
-        Ok(())
+        self.recovery_permit.update(true, targets, self.revision());
     }
 
     fn bump_revision(&mut self) -> Result<()> {
@@ -385,27 +356,14 @@ impl WatchcatDaemon {
 
     fn prepare_reconcile(&mut self) -> Result<ReconcilePlan> {
         self.reload_external_config()?;
-        if self
-            .guard_state()
-            .1
-            .is_some_and(|until| Utc::now() >= until)
-        {
-            self.update_guard(true, None)?;
-        }
         let targets = self.watchlist.list()?;
         self.update_recovery_permit(&targets);
         let now = Utc::now();
-        let refresh_lifecycle = self.last_sweep_at.is_none_or(|last| {
-            now.signed_duration_since(last).num_seconds()
-                >= self.settings.lifecycle.sweep_interval_seconds as i64
-        });
         Ok(ReconcilePlan {
             now,
             revision: self.revision(),
-            guard_enabled: self.guard_state().0,
             targets,
             settings: self.settings.clone(),
-            refresh_lifecycle,
         })
     }
 
@@ -420,65 +378,72 @@ impl WatchcatDaemon {
             .map(|target| target.provider.clone())
             .collect::<HashSet<_>>();
         providers.extend(engine.pending_provider_names());
-        for provider in providers {
-            if let Err(error) = engine.ensure_provider(&provider).await {
-                warn!(%error, %provider, "provider remains unavailable");
-            }
+        if plan.settings.providers.codex.enabled {
+            providers.insert("codex".into());
         }
-        engine.replace_watch_targets(plan.targets.clone());
-        let events = if plan.guard_enabled {
-            engine.run_once_authorized(plan.now, plan.revision).await
-        } else {
-            engine.reconcile_pending_only(plan.now).await
-        }?;
-        let mut session_activity = Vec::new();
+        if plan.settings.providers.claude.enabled {
+            providers.insert("claude".into());
+        }
+        let mut sessions = Vec::new();
         let mut lifecycle_protected = HashSet::new();
-        if plan.guard_enabled && plan.refresh_lifecycle {
-            for provider in plan
-                .targets
-                .iter()
-                .map(|target| target.provider.clone())
-                .collect::<HashSet<_>>()
-            {
-                match engine.list_sessions(&provider, 2_001).await {
-                    Ok(sessions) => {
-                        let complete = sessions.len() <= 2_000;
-                        let observed = sessions
-                            .iter()
-                            .map(|session| session.key())
-                            .collect::<HashSet<_>>();
-                        session_activity.extend(sessions.into_iter().filter_map(|session| {
-                            session
-                                .updated_at
-                                .map(|updated| (session.provider, session.id, updated))
-                        }));
-                        if !complete {
-                            lifecycle_protected.extend(
-                                plan.targets
-                                    .iter()
-                                    .filter(|target| {
-                                        target.provider == provider
-                                            && !observed.contains(&target.key())
-                                    })
-                                    .map(WatchTarget::key),
-                            );
+        for provider in providers {
+            let result = async {
+                engine.ensure_provider(&provider).await?;
+                engine
+                    .recent_sessions(
+                        &provider,
+                        plan.now
+                            - chrono::Duration::seconds(
+                                plan.settings.lifecycle.stale_after_seconds,
+                            ),
+                    )
+                    .await
+            }
+            .await;
+            match result {
+                Ok(found) => {
+                    for session in &found {
+                        if session.state == crate::models::SessionState::Active
+                            || session.updated_at.is_none()
+                        {
+                            lifecycle_protected.insert(session.key());
                         }
                     }
-                    Err(error) => {
-                        warn!(%error, %provider, "cannot refresh session activity before lifecycle sweep");
-                        lifecycle_protected.extend(
-                            plan.targets
-                                .iter()
-                                .filter(|target| target.provider == provider)
-                                .map(WatchTarget::key),
-                        );
-                    }
+                    sessions.extend(found);
+                }
+                Err(error) => {
+                    warn!(%error, %provider, "cannot discover provider sessions");
+                    lifecycle_protected.extend(
+                        plan.targets
+                            .iter()
+                            .filter(|t| t.provider == provider)
+                            .map(WatchTarget::key),
+                    );
                 }
             }
         }
+        // Never send recovery to an expired target while waiting for membership commit.
+        let cutoff =
+            plan.now - chrono::Duration::seconds(plan.settings.lifecycle.stale_after_seconds);
+        let activity = sessions
+            .iter()
+            .map(|s| (s.key(), s.updated_at))
+            .collect::<HashMap<_, _>>();
+        let targets = plan
+            .targets
+            .iter()
+            .filter(|target| {
+                let updated = activity.get(&target.key()).copied().flatten();
+                lifecycle_protected.contains(&target.key())
+                    || target.inactivity_since(updated) >= cutoff
+            })
+            .cloned()
+            .collect();
+        engine.replace_watch_targets(targets);
+        let events = engine.run_once_authorized(plan.now, plan.revision).await?;
         Ok(ReconcileOutcome {
             events,
-            session_activity,
+            sessions,
             lifecycle_protected,
         })
     }
@@ -489,56 +454,34 @@ impl WatchcatDaemon {
         plan: &ReconcilePlan,
         outcome: &ReconcileOutcome,
     ) -> Result<()> {
+        // A manual removal/config edit during discovery invalidates the whole result.
         if self.revision() != plan.revision || self.recovery_permit.generation() != plan.revision {
             return Ok(());
         }
-        self.attention_target_keys = engine.unresolved_target_keys().into_iter().collect();
+        let targets = self.watchlist.reconcile(
+            &outcome.sessions,
+            plan.now,
+            self.settings.lifecycle.stale_after_seconds,
+            &outcome.lifecycle_protected,
+        )?;
+        self.update_recovery_permit(&targets);
+        if targets != plan.targets {
+            self.bump_revision()?;
+        }
+        self.update_recovery_permit(&targets);
+        engine.replace_watch_targets(targets.clone());
+        let keys = targets.iter().map(WatchTarget::key).collect::<HashSet<_>>();
+        self.attention_target_keys = engine
+            .unresolved_target_keys()
+            .into_iter()
+            .filter(|k| keys.contains(k))
+            .collect();
         self.attention_target_keys.sort();
         let month_start = Utc
             .with_ymd_and_hms(plan.now.year(), plan.now.month(), 1, 0, 0, 0)
             .single()
             .unwrap_or(plan.now);
         self.metrics = engine.metrics_since(month_start);
-        for event in &outcome.events {
-            if let Some((provider, session_id)) = event.target.split_once(':') {
-                let _ = self.watchlist.touch(provider, session_id, event.timestamp);
-            }
-        }
-        for (provider, session_id, updated_at) in &outcome.session_activity {
-            let _ = self.watchlist.touch(provider, session_id, *updated_at);
-        }
-        if plan.guard_enabled && plan.refresh_lifecycle {
-            self.sweep_stale(engine, plan.now, &outcome.lifecycle_protected)?;
-        }
-        Ok(())
-    }
-
-    fn sweep_stale(
-        &mut self,
-        engine: &mut WatchEngine,
-        now: chrono::DateTime<Utc>,
-        lifecycle_protected: &HashSet<String>,
-    ) -> Result<()> {
-        let settings = self.settings.clone();
-        self.last_sweep_at = Some(now);
-        let mut unresolved = if settings.lifecycle.protect_unresolved_failures {
-            engine.unresolved_target_keys()
-        } else {
-            HashSet::new()
-        };
-        unresolved.extend(lifecycle_protected.iter().cloned());
-        let (targets, removed) = self.watchlist.plan_stale_removal(
-            now,
-            settings.lifecycle.stale_after_seconds,
-            &unresolved,
-        )?;
-        if !removed.is_empty() {
-            self.bump_revision()?;
-            self.watchlist.replace(targets.clone())?;
-            self.update_recovery_permit(&targets);
-            info!(count = removed.len(), "removed stale watch targets");
-            engine.replace_watch_targets(targets);
-        }
         Ok(())
     }
 
@@ -589,109 +532,60 @@ impl WatchcatDaemon {
 
     fn dispatch_control(&mut self, request: &RpcRequest) -> Result<Value> {
         match request.method.as_str() {
-            "service.ping" | "daemon.ping" => {
-                Ok(json!({"online": true, "version": env!("CARGO_PKG_VERSION")}))
-            }
+            "service.ping" => Ok(json!({"online": true, "version": env!("CARGO_PKG_VERSION")})),
             "snapshot.get" => Ok(serde_json::to_value(self.snapshot()?)?),
-            "guard.set" => {
-                self.check_revision(request)?;
-                let enabled = request
-                    .params
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .context("enabled is required")?;
-                self.update_guard(enabled, None)?;
-                Ok(json!({"enabled": enabled}))
-            }
-            "guard.pause" => {
-                self.check_revision(request)?;
-                let seconds = request
-                    .params
-                    .get("seconds")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(1_800);
-                if !(60..=86_400).contains(&seconds) {
-                    bail!("guard pause must be between 60 and 86400 seconds");
+            "sessions.list" => {
+                let query: crate::protocol::ManagedSessionQuery = decode(&request.params)?;
+                if query.limit == 0 {
+                    bail!("session limit must be positive");
                 }
-                let until = Utc::now() + chrono::Duration::seconds(seconds);
-                self.update_guard(false, Some(until))?;
-                Ok(json!({"enabled": false, "paused_until": until}))
+                let mut targets = self.watchlist.list()?;
+                targets.retain(|target| {
+                    query
+                        .provider
+                        .as_ref()
+                        .is_none_or(|p| p == &target.provider)
+                });
+                targets.sort_by_key(|target| {
+                    std::cmp::Reverse(target.last_activity_at.unwrap_or(target.added_at))
+                });
+                targets.truncate(query.limit);
+                serde_json::to_value(targets).map_err(Into::into)
             }
-            "watch.list" => serde_json::to_value(self.watchlist.list()?).map_err(Into::into),
-            "watch.add" => {
+            "sessions.add" => {
                 self.check_revision(request)?;
-                let add: WatchAdd = decode(&request.params)?;
+                let add: SessionAdd = decode(&request.params)?;
                 if add.validate {
-                    bail!("validated watch.add must use the provider worker");
+                    bail!("validated sessions.add must use the provider worker");
                 }
                 let target = WatchTarget {
+                    source: crate::models::TrackingSource::Manual,
                     provider: add.session.provider,
                     session_id: add.session.session_id,
-                    enabled: true,
-                    protected: add.protected,
                     label: add.label,
+                    title: None,
                     added_at: Utc::now(),
-                    last_event_at: None,
+                    last_activity_at: None,
                 };
-                let mut targets = self.watchlist.list()?;
-                let added = !targets
-                    .iter()
-                    .any(|existing| existing.key() == target.key());
-                if added {
-                    targets.push(target.clone());
-                    self.bump_revision()?;
-                    self.watchlist.replace(targets.clone())?;
-                    self.update_recovery_permit(&targets);
-                }
+                self.bump_revision()?;
+                let added = self.watchlist.add(target.clone())?;
+                self.update_recovery_permit(&self.watchlist.list()?);
                 Ok(json!({"added": added, "target": target}))
             }
-            "watch.update" => {
-                self.check_revision(request)?;
-                let update: WatchUpdate = decode(&request.params)?;
-                let mut targets = self.watchlist.list()?;
-                let mut changed = false;
-                if let Some(target) = targets.iter_mut().find(|target| {
-                    target.provider == update.session.provider
-                        && target.session_id == update.session.session_id
-                }) {
-                    if let Some(enabled) = update.enabled {
-                        if target.enabled != enabled {
-                            target.enabled = enabled;
-                            changed = true;
-                        }
-                    }
-                    if let Some(protected) = update.protected {
-                        if target.protected != protected {
-                            target.protected = protected;
-                            changed = true;
-                        }
-                    }
-                }
-                if changed {
-                    self.bump_revision()?;
-                    self.watchlist.replace(targets.clone())?;
-                    self.update_recovery_permit(&targets);
-                }
-                Ok(json!({"changed": changed}))
-            }
-            "watch.remove" => {
+            "sessions.remove" => {
                 self.check_revision(request)?;
                 let session: SessionRef = decode(&request.params)?;
-                let mut targets = self.watchlist.list()?;
-                let original = targets.len();
-                targets.retain(|target| {
-                    target.provider != session.provider || target.session_id != session.session_id
-                });
-                let removed = targets.len() != original;
-                if removed {
-                    self.bump_revision()?;
-                    self.watchlist.replace(targets.clone())?;
-                    self.update_recovery_permit(&targets);
-                }
+                self.bump_revision()?;
+                let removed = self
+                    .watchlist
+                    .remove(&format!("{}:{}", session.provider, session.session_id))?;
+                self.update_recovery_permit(&self.watchlist.list()?);
                 Ok(json!({"removed": removed}))
             }
-            "policies.list" => serde_json::to_value(self.settings.policies()).map_err(Into::into),
-            "policies.set" => {
+            "config.policies.list" => {
+                serde_json::to_value(self.settings.policies()).map_err(Into::into)
+            }
+            "config.policies.set" => {
                 self.check_revision(request)?;
                 let update: PolicyUpdate = decode(&request.params)?;
                 if !is_known(&update.condition) {
@@ -727,7 +621,7 @@ impl WatchcatDaemon {
                 self.settings = settings;
                 Ok(json!({"updated": true}))
             }
-            "policies.reset" => {
+            "config.policies.reset" => {
                 self.check_revision(request)?;
                 let mut settings = self.settings.clone();
                 match request.params.get("condition").and_then(Value::as_str) {
@@ -766,15 +660,11 @@ impl WatchcatDaemon {
         let targets = self.watchlist.list()?;
         let attention = self.attention_target_keys.len();
         let now = Utc::now();
-        let (guard_enabled, guard_paused_until) = self.guard_state();
         Ok(Snapshot {
             generated_at: now,
             revision: self.revision(),
             service_online: true,
-            guard_enabled,
-            guard_paused_until,
             watched: targets.len(),
-            paused: targets.iter().filter(|target| !target.enabled).count(),
             attention,
             attention_target_keys: self.attention_target_keys.clone(),
             automatic_recoveries: self.metrics.automatic_recoveries,
@@ -825,8 +715,8 @@ fn provider_log_limit(query: &ActivityQuery) -> usize {
 fn requires_provider(method: &str, params: &Value) -> bool {
     matches!(
         method,
-        "sessions.list" | "sessions.logs" | "sessions.send" | "sessions.interrupt"
-    ) || (method == "watch.add"
+        "sessions.search" | "sessions.logs" | "sessions.send" | "sessions.interrupt"
+    ) || (method == "sessions.add"
         && params
             .get("validate")
             .and_then(Value::as_bool)
@@ -876,7 +766,7 @@ async fn dispatch_provider(
         );
     }
     match request.method.as_str() {
-        "sessions.list" => {
+        "sessions.search" => {
             let query: SessionQuery = decode(&request.params)?;
             engine.ensure_provider(&query.provider).await?;
             let watched = watchlist
@@ -980,8 +870,8 @@ async fn dispatch_provider(
             )
             .map_err(Into::into)
         }
-        "watch.add" => {
-            let add: WatchAdd = decode(&request.params)?;
+        "sessions.add" => {
+            let add: SessionAdd = decode(&request.params)?;
             engine.ensure_provider(&add.session.provider).await?;
             engine
                 .validate_session(&add.session.provider, &add.session.session_id)
@@ -1461,7 +1351,7 @@ pub async fn serve(paths: Paths, dry_run: bool) -> Result<()> {
                                 Err(error) => Err(error),
                             };
                             match provider_result {
-                                Ok(_) if method == "watch.add" => {
+                                Ok(_) if method == "sessions.add" => {
                                     let mut request = request;
                                     request.params["validate"] = Value::Bool(false);
                                     daemon.lock().await.handle_control(request)
@@ -1552,16 +1442,13 @@ fn modified_time(path: &PathBuf) -> Option<std::time::SystemTime> {
 fn is_mutation(method: &str) -> bool {
     matches!(
         method,
-        "guard.set"
-            | "guard.pause"
-            | "sessions.send"
+        "sessions.send"
             | "sessions.interrupt"
             | "sessions.retry_now"
-            | "watch.add"
-            | "watch.update"
-            | "watch.remove"
-            | "policies.set"
-            | "policies.reset"
+            | "sessions.add"
+            | "sessions.remove"
+            | "config.policies.set"
+            | "config.policies.reset"
             | "config.set_lifecycle"
     )
 }
@@ -1569,12 +1456,7 @@ fn is_mutation(method: &str) -> bool {
 fn requires_recovery_boundary(method: &str) -> bool {
     matches!(
         method,
-        "guard.set"
-            | "guard.pause"
-            | "watch.update"
-            | "watch.remove"
-            | "policies.set"
-            | "policies.reset"
+        "sessions.remove" | "config.policies.set" | "config.policies.reset"
     )
 }
 
@@ -1594,6 +1476,78 @@ mod tests {
             lock_file: directory.join("watchcat.lock"),
             socket_file: directory.join("watchcat.sock"),
         }
+    }
+
+    #[tokio::test]
+    async fn managed_session_filter_and_limit_are_applied_before_rpc_encoding() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut daemon = WatchcatDaemon::load(test_paths(directory.path()))
+            .await
+            .unwrap();
+        for (provider, id) in [("codex", "one"), ("claude", "two"), ("claude", "three")] {
+            daemon
+                .watchlist
+                .add(WatchTarget {
+                    source: crate::models::TrackingSource::Manual,
+                    provider: provider.into(),
+                    session_id: id.into(),
+                    label: None,
+                    title: None,
+                    added_at: Utc::now(),
+                    last_activity_at: None,
+                })
+                .unwrap();
+        }
+        let response = daemon.handle_control(RpcRequest {
+            version: PROTOCOL_VERSION,
+            id: "list".into(),
+            method: "sessions.list".into(),
+            params: json!({"provider":"claude", "limit":1}),
+            expected_revision: None,
+        });
+        let items = response.result.unwrap();
+        assert_eq!(items.as_array().unwrap().len(), 1);
+        assert_eq!(items[0]["provider"], "claude");
+    }
+
+    #[tokio::test]
+    async fn manual_removal_invalidates_a_scan_already_in_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut daemon = WatchcatDaemon::load(test_paths(directory.path()))
+            .await
+            .unwrap();
+        let mut engine = daemon.build_engine(true).unwrap();
+        let plan = daemon.prepare_reconcile().unwrap();
+        let session = crate::models::Session {
+            provider: "codex".into(),
+            id: "new".into(),
+            title: "New work".into(),
+            state: crate::models::SessionState::Idle,
+            updated_at: Some(plan.now),
+            metadata: Value::Null,
+        };
+        let response = daemon.handle_control(RpcRequest {
+            version: PROTOCOL_VERSION,
+            id: "remove".into(),
+            method: "sessions.remove".into(),
+            params: json!({"provider": "codex", "session_id": "new"}),
+            expected_revision: Some(plan.revision),
+        });
+        assert!(response.error.is_none());
+        let outcome = ReconcileOutcome {
+            events: vec![],
+            sessions: vec![session],
+            lifecycle_protected: HashSet::new(),
+        };
+        daemon
+            .commit_reconcile(&mut engine, &plan, &outcome)
+            .unwrap();
+        assert!(daemon.watchlist.list().unwrap().is_empty());
+        let fresh = daemon.prepare_reconcile().unwrap();
+        daemon
+            .commit_reconcile(&mut engine, &fresh, &outcome)
+            .unwrap();
+        assert!(daemon.watchlist.list().unwrap().is_empty());
     }
 
     #[test]
@@ -1629,24 +1583,27 @@ mod tests {
     #[test]
     fn provider_methods_are_kept_off_the_control_plane() {
         for method in [
-            "sessions.list",
+            "sessions.search",
             "sessions.logs",
             "sessions.send",
             "sessions.interrupt",
         ] {
             assert!(requires_provider(method, &json!({})), "{method}");
         }
-        assert!(requires_provider("watch.add", &json!({"validate": true})));
-        assert!(!requires_provider("watch.add", &json!({"validate": false})));
+        assert!(requires_provider(
+            "sessions.add",
+            &json!({"validate": true})
+        ));
+        assert!(!requires_provider(
+            "sessions.add",
+            &json!({"validate": false})
+        ));
         for method in [
             "snapshot.get",
-            "guard.set",
-            "guard.pause",
-            "watch.list",
-            "watch.update",
-            "watch.remove",
-            "policies.list",
-            "policies.set",
+            "sessions.list",
+            "sessions.remove",
+            "config.policies.list",
+            "config.policies.set",
             "config.get",
             "config.set_lifecycle",
         ] {
@@ -1757,7 +1714,7 @@ mod tests {
         let request = RpcRequest {
             version: PROTOCOL_VERSION,
             id: "policy".into(),
-            method: "policies.set".into(),
+            method: "config.policies.set".into(),
             params: json!({
                 "condition": "network.timeout",
                 "policy": {"action": "skip"},
@@ -1769,7 +1726,7 @@ mod tests {
 
         assert!(response.error.is_some());
         assert!(daemon.revision() > old_revision);
-        let reopened = ControlStateStore::load(paths.control_state_file, (true, None), 0).unwrap();
+        let reopened = ControlStateStore::load(paths.control_state_file).unwrap();
         assert!(reopened.revision() > old_revision);
     }
 

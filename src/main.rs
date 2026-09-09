@@ -1,9 +1,7 @@
-use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -12,15 +10,11 @@ use watchcat::client::WatchcatClient;
 use watchcat::conditions::is_known;
 use watchcat::config::{
     Paths, PolicyOverride, Settings, display_settings, initialize_config, load_settings,
-    save_settings,
 };
-use watchcat::engine::{RecoveryPermit, WatchEngine};
-use watchcat::models::{BackoffKind, MessageTransport, PolicyAction, SessionLog, WatchTarget};
-use watchcat::providers::{CodexProvider, Provider};
-use watchcat::state::{
-    ControlStateStore, EventLogStore, ProcessLock, RuntimeState, WatchlistStore,
-};
-use watchcat::transport::codex_desktop::CodexDesktopIpc;
+use watchcat::models::{BackoffKind, PolicyAction, SessionLog, WatchTarget};
+use watchcat::state::ProcessLock;
+
+mod service;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,38 +35,29 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect Watchcat and watched sessions.
-    Status(OutputArgs),
-    /// Run the watchdog.
-    Run(RunArgs),
+    /// Manage the background server and start-at-login registration.
+    Service {
+        #[command(subcommand)]
+        command: service::ServiceCommand,
+    },
     /// Discover sessions and inspect their logs.
     Session {
         #[command(subcommand)]
         command: SessionCommand,
-    },
-    /// Manage the explicit session watchlist.
-    Watch {
-        #[command(subcommand)]
-        command: WatchCommand,
-    },
-    /// Inspect and edit recovery policies.
-    Policy {
-        #[command(subcommand)]
-        command: PolicyCommand,
     },
     /// Initialize, inspect, and validate configuration.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Verify configuration and provider connectivity.
-    Doctor(OutputArgs),
 }
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    /// List recent sessions from a provider.
+    /// List managed sessions across providers.
     List(SessionListArgs),
+    /// Search provider sessions, including sessions outside the managed list.
+    Search(SessionSearchArgs),
     /// Show one provider session.
     Show(SessionIdArgs),
     /// Show recent provider and Watchcat events for one session.
@@ -81,12 +66,6 @@ enum SessionCommand {
     Send(SessionSendArgs),
     /// Interrupt the active turn in a provider session.
     Interrupt(SessionIdArgs),
-}
-
-#[derive(Debug, Subcommand)]
-enum WatchCommand {
-    /// List explicitly watched sessions.
-    List(OutputArgs),
     /// Add one session to the watchlist.
     Add {
         session_id: String,
@@ -124,6 +103,11 @@ enum PolicyCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Inspect and edit recovery policies stored in this configuration.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
     /// Write a documented default configuration.
     Init {
         #[arg(long)]
@@ -138,19 +122,21 @@ enum ConfigCommand {
 }
 
 #[derive(Debug, Args)]
-struct RunArgs {
-    /// Perform one reconciliation and exit.
+struct SessionListArgs {
     #[arg(long)]
-    once: bool,
-    /// Report recovery actions without sending prompts.
-    #[arg(long)]
-    dry_run: bool,
+    provider: Option<String>,
+    #[arg(long, default_value_t = 50, value_parser = parse_positive_usize)]
+    limit: usize,
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
-struct SessionListArgs {
+struct SessionSearchArgs {
+    #[arg(default_value = "")]
+    query: String,
+    #[arg(long)]
+    cursor: Option<String>,
     #[arg(long, default_value = "codex")]
     provider: String,
     #[arg(long, default_value_t = 50, value_parser = parse_positive_usize)]
@@ -250,6 +236,39 @@ async fn run() -> Result<()> {
     configure_logging(cli.verbose)?;
     let paths = Paths::discover(cli.config)?;
     match cli.command {
+        Command::Service {
+            command: service::ServiceCommand::Status { json },
+        } => {
+            let client = WatchcatClient::new(paths.socket_file.clone());
+            match client.request("snapshot.get", json!({}), None).await {
+                Ok((value, _)) => {
+                    if json {
+                        emit_value(&value, true)?;
+                    } else {
+                        println!(
+                            "Watchcat service online · {} sessions · {} need attention",
+                            value["watched"], value["attention"]
+                        );
+                    }
+                }
+                Err(error) => {
+                    if json {
+                        emit_value(
+                            &json!({"service_online": false, "error": error.to_string()}),
+                            true,
+                        )?;
+                    } else {
+                        println!("Watchcat service offline: {error}");
+                    }
+                }
+            }
+        }
+        Command::Service { command } => service::run(command, &paths)?,
+        Command::Config {
+            command: ConfigCommand::Policy { command },
+        } => {
+            policy_command(&WatchcatClient::new(paths.socket_file.clone()), command).await?;
+        }
         Command::Config {
             command: ConfigCommand::Init { force },
         } => {
@@ -264,86 +283,32 @@ async fn run() -> Result<()> {
             let settings = load_settings(&paths.config_file)?;
             config_command(&settings, &paths, command)?;
         }
-        command => {
-            if paths.socket_file.exists() && !matches!(command, Command::Run(_)) {
-                match ProcessLock::acquire(paths.lock_file.clone()) {
-                    Err(_) => return dispatch_daemon(command, &paths).await,
-                    Ok(lock) => drop(lock),
-                }
-            }
-            let _direct_lock = if matches!(command, Command::Run(_)) {
-                None
-            } else {
-                Some(ProcessLock::acquire(paths.lock_file.clone()).with_context(
-                    || "Watchcat service owns this state but its control socket is unavailable",
-                )?)
-            };
-            let settings = load_settings(&paths.config_file)?;
-            let watchlist = WatchlistStore::new(paths.watchlist_file.clone());
-            dispatch(command, settings, paths, watchlist).await?;
-        }
+        command => dispatch(command, &paths).await?,
     }
     Ok(())
 }
 
-async fn dispatch_daemon(command: Command, paths: &Paths) -> Result<()> {
+async fn dispatch(command: Command, paths: &Paths) -> Result<()> {
     let client = WatchcatClient::new(paths.socket_file.clone());
     match command {
-        Command::Status(args) => {
-            let (value, _) = client.request("snapshot.get", json!({}), None).await?;
-            if args.json {
-                emit_value(&value, true)
-            } else {
-                println!(
-                    "Watchcat service online · {} watched · {} paused · {} need attention",
-                    value["watched"].as_u64().unwrap_or(0),
-                    value["paused"].as_u64().unwrap_or(0),
-                    value["attention"].as_u64().unwrap_or(0)
-                );
-                println!(
-                    "This month: {} automatic recoveries · {}% hands-free",
-                    value["automatic_recoveries"].as_u64().unwrap_or(0),
-                    value["hands_free_percent"].as_u64().unwrap_or(100)
-                );
-                Ok(())
-            }
-        }
-        Command::Session { command } => daemon_session_command(&client, command).await,
-        Command::Watch { command } => daemon_watch_command(&client, command).await,
-        Command::Policy { command } => daemon_policy_command(&client, command).await,
-        Command::Doctor(args) => {
-            let (value, _) = client.request("service.ping", json!({}), None).await?;
-            if args.json {
-                emit_value(
-                    &json!([{"name":"watchcat_service","ok":true,"detail":value}]),
-                    true,
-                )
-            } else {
-                println!("CHECK      RESULT  DETAIL");
-                println!(
-                    "service   ok      connected at {}",
-                    paths.socket_file.display()
-                );
-                Ok(())
-            }
-        }
-        Command::Run(_) | Command::Config { .. } => unreachable!(),
+        Command::Session { command } => session_command(&client, command).await,
+        Command::Config { .. } | Command::Service { .. } => unreachable!(),
     }
 }
 
-async fn daemon_session_command(client: &WatchcatClient, command: SessionCommand) -> Result<()> {
+async fn session_command(client: &WatchcatClient, command: SessionCommand) -> Result<()> {
     match command {
-        SessionCommand::List(args) => {
+        SessionCommand::Search(args) => {
             let (value, _) = client
                 .request(
-                    "sessions.list",
-                    json!({"provider": args.provider, "limit": args.limit}),
+                    "sessions.search",
+                    json!({"provider": args.provider, "limit": args.limit, "query": args.query, "cursor": args.cursor}),
                     None,
                 )
                 .await?;
             let items = value["items"].as_array().cloned().unwrap_or_default();
             if args.json {
-                emit_value(&Value::Array(items), true)
+                emit_value(&value, true)
             } else {
                 let rows = items
                     .iter()
@@ -368,7 +333,7 @@ async fn daemon_session_command(client: &WatchcatClient, command: SessionCommand
         SessionCommand::Show(args) => {
             let (value, _) = client
                 .request(
-                    "sessions.list",
+                    "sessions.search",
                     json!({"provider": args.provider, "limit": 1, "query": args.session_id}),
                     None,
                 )
@@ -379,7 +344,7 @@ async fn daemon_session_command(client: &WatchcatClient, command: SessionCommand
                 .and_then(|item| item.get("session"))
                 .cloned()
                 .context("session not found")?;
-            emit_value(&session, true || args.json)
+            emit_value(&session, args.json)
         }
         SessionCommand::Logs(args) => {
             let (value, _) = client
@@ -436,45 +401,70 @@ async fn daemon_session_command(client: &WatchcatClient, command: SessionCommand
                 Ok(())
             }
         }
-    }
-}
-
-async fn daemon_watch_command(client: &WatchcatClient, command: WatchCommand) -> Result<()> {
-    let (_, revision) = client.request("snapshot.get", json!({}), None).await?;
-    match command {
-        WatchCommand::List(args) => {
-            let (value, _) = client.request("watch.list", json!({}), None).await?;
+        SessionCommand::List(args) => {
+            let (value, _) = client
+                .request(
+                    "sessions.list",
+                    json!({"provider": args.provider, "limit": args.limit}),
+                    None,
+                )
+                .await?;
+            let targets: Vec<WatchTarget> = serde_json::from_value(value)?;
             if args.json {
+                let value = Value::Array(
+                    targets
+                        .iter()
+                        .map(|target| {
+                            let mut value =
+                                serde_json::to_value(target).expect("session target serialization");
+                            value["recovery_supported"] =
+                                json!(watchcat::providers::supports_recovery(&target.provider));
+                            value
+                        })
+                        .collect(),
+                );
                 emit_value(&value, true)
             } else {
-                let targets: Vec<WatchTarget> = serde_json::from_value(value)?;
                 let rows = targets
                     .iter()
                     .map(|target| {
                         vec![
                             target.provider.clone(),
                             target.session_id.clone(),
-                            if target.enabled { "active" } else { "paused" }.into(),
-                            if target.protected { "yes" } else { "" }.into(),
-                            target.label.clone().unwrap_or_default(),
+                            if watchcat::providers::supports_recovery(&target.provider) {
+                                "recovery"
+                            } else {
+                                "observe"
+                            }
+                            .into(),
+                            target
+                                .last_activity_at
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_default(),
+                            target
+                                .label
+                                .clone()
+                                .or_else(|| target.title.clone())
+                                .unwrap_or_default(),
                         ]
                     })
                     .collect::<Vec<_>>();
                 print_table(
-                    &["PROVIDER", "SESSION", "STATE", "PROTECTED", "LABEL"],
+                    &["PROVIDER", "SESSION", "MODE", "LAST ACTIVITY", "LABEL"],
                     &rows,
                 );
                 Ok(())
             }
         }
-        WatchCommand::Add {
+        SessionCommand::Add {
             session_id,
             provider,
             label,
             no_validate,
         } => {
+            let (_, revision) = client.request("snapshot.get", json!({}), None).await?;
             let (value, _) = client.request(
-                "watch.add",
+                "sessions.add",
                 json!({"provider": provider, "session_id": session_id, "label": label, "validate": !no_validate}),
                 Some(revision),
             ).await?;
@@ -488,20 +478,24 @@ async fn daemon_watch_command(client: &WatchcatClient, command: WatchCommand) ->
             );
             Ok(())
         }
-        WatchCommand::Remove(args) => {
+        SessionCommand::Remove(args) => {
+            let (_, revision) = client.request("snapshot.get", json!({}), None).await?;
             let (value, _) = client
                 .request(
-                    "watch.remove",
+                    "sessions.remove",
                     json!({"provider": args.provider, "session_id": args.session_id}),
                     Some(revision),
                 )
                 .await?;
+            if args.json {
+                return emit_value(&value, true);
+            }
             println!(
                 "{}",
                 if value["removed"].as_bool() == Some(true) {
                     "Removed"
                 } else {
-                    "Not watched"
+                    "Excluded from automatic discovery"
                 }
             );
             Ok(())
@@ -509,11 +503,13 @@ async fn daemon_watch_command(client: &WatchcatClient, command: WatchCommand) ->
     }
 }
 
-async fn daemon_policy_command(client: &WatchcatClient, command: PolicyCommand) -> Result<()> {
+async fn policy_command(client: &WatchcatClient, command: PolicyCommand) -> Result<()> {
     let (_, revision) = client.request("snapshot.get", json!({}), None).await?;
     match command {
         PolicyCommand::List(args) => {
-            let (value, _) = client.request("policies.list", json!({}), None).await?;
+            let (value, _) = client
+                .request("config.policies.list", json!({}), None)
+                .await?;
             let mut policies: Vec<watchcat::config::ResolvedPolicy> =
                 serde_json::from_value(value)?;
             policies.retain(|policy| {
@@ -530,7 +526,9 @@ async fn daemon_policy_command(client: &WatchcatClient, command: PolicyCommand) 
         }
         PolicyCommand::Show { condition, json } => {
             require_condition(&condition)?;
-            let (value, _) = client.request("policies.list", json!({}), None).await?;
+            let (value, _) = client
+                .request("config.policies.list", json!({}), None)
+                .await?;
             let policies: Vec<watchcat::config::ResolvedPolicy> = serde_json::from_value(value)?;
             let policy = policies
                 .into_iter()
@@ -570,7 +568,7 @@ async fn daemon_policy_command(client: &WatchcatClient, command: PolicyCommand) 
             };
             client
                 .request(
-                    "policies.set",
+                    "config.policies.set",
                     json!({"condition": args.condition, "policy": policy}),
                     Some(revision),
                 )
@@ -585,137 +583,11 @@ async fn daemon_policy_command(client: &WatchcatClient, command: PolicyCommand) 
                 json!({"condition": condition.context("provide CONDITION or use --all")?})
             };
             client
-                .request("policies.reset", params, Some(revision))
+                .request("config.policies.reset", params, Some(revision))
                 .await?;
             println!("Reset policy configuration");
             Ok(())
         }
-    }
-}
-
-async fn dispatch(
-    command: Command,
-    mut settings: Settings,
-    paths: Paths,
-    watchlist: WatchlistStore,
-) -> Result<()> {
-    match command {
-        Command::Status(args) => status(&settings, &watchlist, args.json).await,
-        Command::Run(args) => run_watchdog(settings, paths, &watchlist, args).await,
-        Command::Session { command } => {
-            session_command(&settings, &paths, &watchlist, command).await
-        }
-        Command::Watch { command } => watch_command(&settings, &watchlist, command).await,
-        Command::Policy { command } => policy_command(&mut settings, &paths, command),
-        Command::Config { command } => config_command(&settings, &paths, command),
-        Command::Doctor(args) => doctor(&settings, &paths, args.json).await,
-    }
-}
-
-async fn session_command(
-    settings: &Settings,
-    paths: &Paths,
-    watchlist: &WatchlistStore,
-    command: SessionCommand,
-) -> Result<()> {
-    match command {
-        SessionCommand::List(args) => list_sessions(settings, watchlist, args).await,
-        SessionCommand::Show(args) => {
-            let mut providers = started_provider(settings, &args.provider).await?;
-            let sessions = providers
-                .get_mut(&args.provider)
-                .context("provider was not constructed")?
-                .list_sessions(500)
-                .await?;
-            close_providers(&mut providers).await;
-            let session = sessions
-                .into_iter()
-                .find(|session| session.id == args.session_id)
-                .with_context(|| {
-                    format!("{} session not found: {}", args.provider, args.session_id)
-                })?;
-            emit_serializable(&session, args.json)
-        }
-        SessionCommand::Logs(args) => session_logs(settings, paths, args).await,
-        SessionCommand::Send(args) => send_session_message(settings, args).await,
-        SessionCommand::Interrupt(args) => interrupt_session(settings, args).await,
-    }
-}
-
-async fn send_session_message(settings: &Settings, args: SessionSendArgs) -> Result<()> {
-    let message = message_input(args.message)?;
-    let mut providers = started_provider(settings, &args.provider).await?;
-    let result = async {
-        let provider = providers
-            .get_mut(&args.provider)
-            .context("provider was not constructed")?;
-        provider
-            .send_message(&args.session_id, &message)
-            .await
-            .with_context(|| {
-                format!(
-                    "cannot send to {} session {}",
-                    args.provider, args.session_id
-                )
-            })
-    }
-    .await;
-    close_providers(&mut providers).await;
-    let receipt = result?;
-    if args.json {
-        emit_serializable(&receipt, true)
-    } else {
-        let action = match receipt.delivery {
-            watchcat::models::MessageDelivery::Started => "started",
-            watchcat::models::MessageDelivery::Steered => "steered",
-        };
-        println!(
-            "Sent message to {}:{}; {action} turn {} via {}",
-            receipt.provider,
-            receipt.session_id,
-            receipt.turn_id,
-            transport_name(receipt.transport)
-        );
-        Ok(())
-    }
-}
-
-async fn interrupt_session(settings: &Settings, args: SessionIdArgs) -> Result<()> {
-    let mut providers = started_provider(settings, &args.provider).await?;
-    let result = async {
-        providers
-            .get_mut(&args.provider)
-            .context("provider was not constructed")?
-            .interrupt(&args.session_id)
-            .await
-            .with_context(|| {
-                format!(
-                    "cannot interrupt {} session {}",
-                    args.provider, args.session_id
-                )
-            })
-    }
-    .await;
-    close_providers(&mut providers).await;
-    let receipt = result?;
-    if args.json {
-        emit_serializable(&receipt, true)
-    } else {
-        println!(
-            "Interrupted {}:{} turn {} via {}",
-            receipt.provider,
-            receipt.session_id,
-            receipt.turn_id,
-            transport_name(receipt.transport)
-        );
-        Ok(())
-    }
-}
-
-fn transport_name(transport: MessageTransport) -> &'static str {
-    match transport {
-        MessageTransport::AppServer => "app_server",
-        MessageTransport::DesktopIpc => "desktop_ipc",
     }
 }
 
@@ -740,172 +612,6 @@ fn message_input(argument: Option<String>) -> Result<String> {
     Ok(message.to_owned())
 }
 
-async fn watch_command(
-    settings: &Settings,
-    watchlist: &WatchlistStore,
-    command: WatchCommand,
-) -> Result<()> {
-    match command {
-        WatchCommand::List(args) => emit_watchlist(watchlist, args.json),
-        WatchCommand::Add {
-            session_id,
-            provider,
-            label,
-            no_validate,
-        } => {
-            if !no_validate {
-                let mut providers = started_provider(settings, &provider).await?;
-                let exists = providers
-                    .get_mut(&provider)
-                    .context("provider was not constructed")?
-                    .list_sessions(500)
-                    .await?
-                    .iter()
-                    .any(|session| session.id == session_id);
-                close_providers(&mut providers).await;
-                if !exists {
-                    bail!(
-                        "{provider} session not found in the 500 most recent sessions: {session_id}; use --no-validate only when the id is known to be valid"
-                    );
-                }
-            }
-            let target = WatchTarget {
-                provider,
-                session_id,
-                enabled: true,
-                protected: false,
-                label,
-                added_at: Utc::now(),
-                last_event_at: None,
-            };
-            let added = watchlist.add(target.clone())?;
-            println!(
-                "{} {}",
-                if added {
-                    "Watching"
-                } else {
-                    "Already watching"
-                },
-                target.key()
-            );
-            Ok(())
-        }
-        WatchCommand::Remove(args) => {
-            let removed = watchlist.remove(&args.provider, &args.session_id)?;
-            println!(
-                "{} {}:{}",
-                if removed { "Removed" } else { "Not watched" },
-                args.provider,
-                args.session_id
-            );
-            if !removed {
-                std::process::exit(1)
-            }
-            Ok(())
-        }
-    }
-}
-
-fn policy_command(settings: &mut Settings, paths: &Paths, command: PolicyCommand) -> Result<()> {
-    match command {
-        PolicyCommand::List(args) => {
-            let policies = settings
-                .policies()
-                .into_iter()
-                .filter(|policy| {
-                    args.category
-                        .as_deref()
-                        .is_none_or(|category| policy.condition.split('.').next() == Some(category))
-                })
-                .collect::<Vec<_>>();
-            if args.json {
-                emit_serializable(&policies, true)
-            } else {
-                print_policies(&policies);
-                Ok(())
-            }
-        }
-        PolicyCommand::Show { condition, json } => {
-            require_condition(&condition)?;
-            let policy = settings.policy(&condition);
-            if json {
-                emit_serializable(&policy, true)
-            } else {
-                print_policy_details(&policy);
-                Ok(())
-            }
-        }
-        PolicyCommand::Set(args) => {
-            require_condition(&args.condition)?;
-            if args.action.is_none()
-                && args.backoff.is_none()
-                && args.initial_delay.is_none()
-                && args.max_delay.is_none()
-                && args.max_attempts.is_none()
-                && args.prompt.is_none()
-            {
-                bail!("policy set requires at least one option");
-            }
-            if matches!(args.action, Some(ActionArg::Skip))
-                && (args.backoff.is_some()
-                    || args.initial_delay.is_some()
-                    || args.max_delay.is_some()
-                    || args.max_attempts.is_some())
-            {
-                bail!("--action skip cannot be combined with retry options");
-            }
-            let entry = settings.policies.entry(args.condition.clone()).or_default();
-            if let Some(action) = args.action {
-                entry.action = Some(match action {
-                    ActionArg::Retry => PolicyAction::Retry,
-                    ActionArg::Skip => {
-                        entry.backoff = None;
-                        entry.initial_delay_seconds = None;
-                        entry.max_delay_seconds = None;
-                        entry.max_attempts = None;
-                        PolicyAction::Skip
-                    }
-                });
-            }
-            if let Some(backoff) = args.backoff {
-                entry.backoff = Some(match backoff {
-                    BackoffArg::Fixed => BackoffKind::Fixed,
-                    BackoffArg::Exponential => BackoffKind::Exponential,
-                });
-            }
-            if let Some(value) = args.initial_delay {
-                entry.initial_delay_seconds = Some(value);
-            }
-            if let Some(value) = args.max_delay {
-                entry.max_delay_seconds = Some(value);
-            }
-            if let Some(value) = args.max_attempts {
-                entry.max_attempts = Some(value);
-            }
-            if let Some(value) = args.prompt {
-                entry.prompt = Some(value);
-            }
-            save_settings(&paths.config_file, settings)?;
-            println!("Updated {}", args.condition);
-            Ok(())
-        }
-        PolicyCommand::Reset { condition, all } => {
-            if all {
-                settings.policies.clear();
-                save_settings(&paths.config_file, settings)?;
-                println!("Reset all policies");
-            } else {
-                let condition = condition.context("provide CONDITION or use --all")?;
-                require_condition(&condition)?;
-                settings.policies.remove(&condition);
-                save_settings(&paths.config_file, settings)?;
-                println!("Reset {condition}");
-            }
-            Ok(())
-        }
-    }
-}
-
 fn config_command(settings: &Settings, paths: &Paths, command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Show(args) => {
@@ -926,346 +632,7 @@ fn config_command(settings: &Settings, paths: &Paths, command: ConfigCommand) ->
             Ok(())
         }
         ConfigCommand::Path(args) => emit_value(&path_value(paths), args.json),
-        ConfigCommand::Init { .. } => unreachable!(),
-    }
-}
-
-async fn list_sessions(
-    settings: &Settings,
-    watchlist: &WatchlistStore,
-    args: SessionListArgs,
-) -> Result<()> {
-    let watched = watchlist
-        .list()?
-        .into_iter()
-        .map(|target| target.key())
-        .collect::<HashSet<_>>();
-    let mut providers = started_provider(settings, &args.provider).await?;
-    let sessions = providers
-        .get_mut(&args.provider)
-        .context("provider was not constructed")?
-        .list_sessions(args.limit)
-        .await?;
-    close_providers(&mut providers).await;
-    if args.json {
-        let values = sessions
-            .iter()
-            .map(|session| {
-                json!({
-                    "provider": session.provider, "id": session.id, "title": session.title,
-                    "state": session.state, "updated_at": session.updated_at,
-                    "watched": watched.contains(&session.key()), "metadata": session.metadata,
-                })
-            })
-            .collect::<Vec<_>>();
-        emit_serializable(&values, true)
-    } else {
-        let rows = sessions
-            .iter()
-            .map(|session| {
-                vec![
-                    if watched.contains(&session.key()) {
-                        "*"
-                    } else {
-                        ""
-                    }
-                    .into(),
-                    session.id.clone(),
-                    format!("{:?}", session.state).to_ascii_lowercase(),
-                    session.title.clone(),
-                ]
-            })
-            .collect::<Vec<_>>();
-        print_table(&["WATCH", "SESSION", "STATE", "TITLE"], &rows);
-        Ok(())
-    }
-}
-
-async fn session_logs(settings: &Settings, paths: &Paths, args: SessionLogsArgs) -> Result<()> {
-    let provider_logs = match started_provider(settings, &args.provider).await {
-        Ok(mut providers) => {
-            let result = providers
-                .get_mut(&args.provider)
-                .context("provider was not constructed")?
-                .session_logs(&args.session_id, args.limit)
-                .await;
-            close_providers(&mut providers).await;
-            match result {
-                Ok(logs) => logs,
-                Err(error) => vec![provider_log_error(&args.provider, &args.session_id, error)],
-            }
-        }
-        Err(error) => vec![provider_log_error(&args.provider, &args.session_id, error)],
-    };
-    let watchcat_logs =
-        EventLogStore::new(paths.event_log_file.clone(), settings.engine.log_retention)
-            .session_logs(
-                &args.provider,
-                &args.session_id,
-                args.category.as_deref(),
-                args.limit,
-            )?;
-    let mut logs = provider_logs
-        .into_iter()
-        .chain(watchcat_logs)
-        .filter(|entry| {
-            args.category.as_deref().is_none_or(|category| {
-                entry
-                    .condition
-                    .as_deref()
-                    .is_some_and(|condition| condition.split('.').next() == Some(category))
-                    || entry.kind.split('.').next() == Some(category)
-            })
-        })
-        .collect::<Vec<_>>();
-    logs.sort_by_key(|entry| entry.timestamp);
-    if logs.len() > args.limit {
-        logs.drain(..logs.len() - args.limit);
-    }
-    if args.json {
-        emit_serializable(&logs, true)
-    } else {
-        print_logs(&logs);
-        Ok(())
-    }
-}
-
-async fn status(settings: &Settings, watchlist: &WatchlistStore, json_output: bool) -> Result<()> {
-    let targets = watchlist.list()?;
-    if targets.is_empty() {
-        if json_output {
-            println!("[]");
-        } else {
-            println!(
-                "Watchlist is empty. Use `watchcat session list` and `watchcat watch add <session-id>`."
-            );
-        }
-        return Ok(());
-    }
-    let mut providers = build_providers(
-        settings,
-        targets.iter().map(|target| target.provider.as_str()),
-    )?;
-    start_providers(&mut providers).await?;
-    let mut values = Vec::new();
-    for target in &targets {
-        let result = providers
-            .get_mut(&target.provider)
-            .context("provider was not constructed")?
-            .latest_failure(&target.session_id)
-            .await;
-        match result {
-            Ok(failure) => values.push(json!({"provider": target.provider, "session_id": target.session_id, "label": target.label, "enabled": target.enabled, "failure": failure})),
-            Err(error) => values.push(json!({"provider": target.provider, "session_id": target.session_id, "label": target.label, "enabled": target.enabled, "error": error.to_string()})),
-        }
-    }
-    close_providers(&mut providers).await;
-    if json_output {
-        emit_serializable(&values, true)
-    } else {
-        let rows = values
-            .iter()
-            .map(|value| {
-                let latest = value
-                    .pointer("/failure/condition")
-                    .or_else(|| value.get("error"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("ok");
-                vec![
-                    string_field(value, "provider"),
-                    string_field(value, "session_id"),
-                    latest.into(),
-                    string_field(value, "label"),
-                ]
-            })
-            .collect::<Vec<_>>();
-        print_table(&["PROVIDER", "SESSION", "LATEST", "LABEL"], &rows);
-        Ok(())
-    }
-}
-
-async fn run_watchdog(
-    settings: Settings,
-    paths: Paths,
-    watchlist: &WatchlistStore,
-    args: RunArgs,
-) -> Result<()> {
-    let targets = watchlist
-        .list()?
-        .into_iter()
-        .filter(|target| target.enabled)
-        .collect::<Vec<_>>();
-    if targets.is_empty() {
-        bail!("watchlist is empty; add at least one session before running");
-    }
-    let _lock = ProcessLock::acquire(paths.lock_file.clone())?;
-    let state = RuntimeState::load(paths.state_file.clone())?;
-    let mut control = ControlStateStore::load(
-        paths.control_state_file.clone(),
-        state.guard_state(),
-        state.revision(),
-    )?;
-    let now = Utc::now();
-    let (mut guard_enabled, paused_until) = control.guard_state();
-    if !guard_enabled && paused_until.is_some_and(|until| now >= until) {
-        control.set_guard_state_and_advance(true, None)?;
-        guard_enabled = true;
-    }
-    if !guard_enabled {
-        bail!("guard is disabled; enable it before starting direct mode");
-    }
-    let mut providers = build_providers(
-        &settings,
-        targets.iter().map(|target| target.provider.as_str()),
-    )?;
-    start_providers(&mut providers).await?;
-    let event_log = EventLogStore::new(paths.event_log_file, settings.engine.log_retention);
-    let config_file = paths.config_file.clone();
-    let target_count = targets.len();
-    let recovery_permit = RecoveryPermit::new(true, &targets, control.revision());
-    let mut engine = WatchEngine::new_with_permit(
-        settings,
-        providers,
-        targets,
-        state,
-        event_log,
-        args.dry_run,
-        recovery_permit,
-    );
-    let result = if args.once {
-        let events = engine.run_once(Utc::now()).await?;
-        if args.json {
-            emit_serializable(&events, true)?;
-        } else if events.is_empty() {
-            println!("No recovery action needed.");
-        } else {
-            let rows = events
-                .iter()
-                .map(|event| {
-                    vec![
-                        event.kind.clone(),
-                        event.target.clone(),
-                        event.message.clone(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            print_table(&["EVENT", "TARGET", "DETAIL"], &rows);
-        }
-        Ok(())
-    } else {
-        tracing::info!(
-            targets = target_count,
-            dry_run = args.dry_run,
-            "watchcat started"
-        );
-        engine
-            .run_forever_with(|| {
-                Ok((
-                    Some(watchlist.list()?),
-                    Some(load_settings(&config_file)?),
-                    guard_enabled,
-                ))
-            })
-            .await
-    };
-    engine.close().await;
-    result
-}
-
-async fn doctor(settings: &Settings, paths: &Paths, json_output: bool) -> Result<()> {
-    let executable = settings.providers.codex.command.first().cloned();
-    let found = executable
-        .as_deref()
-        .and_then(find_executable)
-        .map(|path| path.display().to_string());
-    let mut checks = vec![
-        json!({"name": "codex executable", "ok": found.is_some(), "detail": found.unwrap_or_else(|| "not found".into())}),
-    ];
-    if settings.providers.codex.enabled && checks[0]["ok"] == true {
-        let mut providers = build_providers(settings, ["codex"])?;
-        let result = async {
-            start_providers(&mut providers).await?;
-            let count = providers
-                .get_mut("codex")
-                .context("Codex provider missing")?
-                .list_sessions(1)
-                .await?
-                .len();
-            Result::<usize>::Ok(count)
-        }
-        .await;
-        close_providers(&mut providers).await;
-        match result {
-            Ok(count) => checks.push(json!({"name": "Codex App Server", "ok": true, "detail": format!("connected; {count} session(s) sampled")})),
-            Err(error) => checks.push(json!({"name": "Codex App Server", "ok": false, "detail": error.to_string()})),
-        }
-    }
-    match CodexDesktopIpc::probe().await {
-        Ok(true) => checks.push(json!({
-            "name": "Codex Desktop IPC",
-            "ok": true,
-            "detail": "connected; Desktop-owned sessions can be controlled",
-        })),
-        Ok(false) => checks.push(json!({
-            "name": "Codex Desktop IPC",
-            "ok": true,
-            "detail": "not running; optional App Server fallback remains available",
-        })),
-        Err(error) => checks.push(json!({
-            "name": "Codex Desktop IPC",
-            "ok": false,
-            "detail": error.to_string(),
-        })),
-    }
-    checks.push(json!({"name": "configuration", "ok": true, "detail": paths.config_file}));
-    checks.push(json!({"name": "event log", "ok": true, "detail": paths.event_log_file}));
-    if json_output {
-        emit_serializable(&checks, true)?;
-    } else {
-        let rows = checks
-            .iter()
-            .map(|check| {
-                vec![
-                    string_field(check, "name"),
-                    if check.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-                        "ok"
-                    } else {
-                        "failed"
-                    }
-                    .into(),
-                    string_field(check, "detail"),
-                ]
-            })
-            .collect::<Vec<_>>();
-        print_table(&["CHECK", "RESULT", "DETAIL"], &rows);
-    }
-    if checks
-        .iter()
-        .all(|check| check.get("ok").and_then(Value::as_bool) == Some(true))
-    {
-        Ok(())
-    } else {
-        std::process::exit(1)
-    }
-}
-
-fn emit_watchlist(watchlist: &WatchlistStore, json_output: bool) -> Result<()> {
-    let targets = watchlist.list()?;
-    if json_output {
-        emit_serializable(&targets, true)
-    } else {
-        let rows = targets
-            .iter()
-            .map(|target| {
-                vec![
-                    target.provider.clone(),
-                    target.session_id.clone(),
-                    target.label.clone().unwrap_or_default(),
-                ]
-            })
-            .collect::<Vec<_>>();
-        print_table(&["PROVIDER", "SESSION", "LABEL"], &rows);
-        Ok(())
+        ConfigCommand::Init { .. } | ConfigCommand::Policy { .. } => unreachable!(),
     }
 }
 
@@ -1326,21 +693,6 @@ fn print_policy_details(policy: &watchcat::config::ResolvedPolicy) {
     print_table(&["FIELD", "VALUE"], &rows);
 }
 
-fn provider_log_error(provider: &str, session_id: &str, error: anyhow::Error) -> SessionLog {
-    SessionLog {
-        timestamp: Some(Utc::now()),
-        provider: provider.into(),
-        session_id: session_id.into(),
-        source: "provider".into(),
-        kind: "provider.error".into(),
-        role: None,
-        turn_id: None,
-        condition: None,
-        message: error.to_string(),
-        metadata: Value::Null,
-    }
-}
-
 fn print_logs(logs: &[SessionLog]) {
     let rows = logs
         .iter()
@@ -1364,62 +716,12 @@ fn require_condition(condition: &str) -> Result<()> {
     if is_known(condition) {
         Ok(())
     } else {
-        bail!("unknown policy condition: {condition}; run `watchcat policy list`")
+        bail!("unknown policy condition: {condition}; run `watchcat config policy list`")
     }
 }
 
 fn path_value(paths: &Paths) -> Value {
     json!({"config": paths.config_file, "watchlist": paths.watchlist_file, "state": paths.state_file, "control": paths.control_state_file, "events": paths.event_log_file, "retry_operations": paths.retry_operations_file, "lock": paths.lock_file})
-}
-
-fn build_providers<'a>(
-    settings: &Settings,
-    names: impl IntoIterator<Item = &'a str>,
-) -> Result<HashMap<String, Box<dyn Provider>>> {
-    let mut providers = HashMap::<String, Box<dyn Provider>>::new();
-    for name in names {
-        if providers.contains_key(name) {
-            continue;
-        }
-        match name {
-            "codex" if settings.providers.codex.enabled => {
-                providers.insert(
-                    name.into(),
-                    Box::new(CodexProvider::new(&settings.providers.codex)?),
-                );
-            }
-            "codex" => bail!("provider is disabled: codex"),
-            "claude" => bail!(
-                "Claude error definitions are available, but the Claude session adapter is not enabled in this release"
-            ),
-            _ => bail!("unknown provider: {name}"),
-        }
-    }
-    Ok(providers)
-}
-
-async fn started_provider(
-    settings: &Settings,
-    provider: &str,
-) -> Result<HashMap<String, Box<dyn Provider>>> {
-    let mut providers = build_providers(settings, [provider])?;
-    start_providers(&mut providers).await?;
-    Ok(providers)
-}
-
-async fn start_providers(providers: &mut HashMap<String, Box<dyn Provider>>) -> Result<()> {
-    for provider in providers.values_mut() {
-        provider.start().await?;
-    }
-    Ok(())
-}
-
-async fn close_providers(providers: &mut HashMap<String, Box<dyn Provider>>) {
-    for provider in providers.values_mut() {
-        if let Err(error) = provider.close().await {
-            tracing::warn!(%error, provider = provider.name(), "provider shutdown failed");
-        }
-    }
 }
 
 fn emit_serializable(value: &impl Serialize, json_output: bool) -> Result<()> {
@@ -1485,33 +787,6 @@ fn print_row(row: &[String], widths: &[usize]) {
         })
         .collect::<Vec<_>>();
     println!("{}", cells.join("  "));
-}
-
-fn string_field(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn find_executable(name: &str) -> Option<PathBuf> {
-    let candidate = PathBuf::from(name);
-    if candidate.components().count() > 1 && candidate.is_file() {
-        return Some(candidate);
-    }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .flat_map(|directory| {
-                let base = directory.join(name);
-                #[cfg(windows)]
-                let candidates = vec![base.clone(), base.with_extension("exe")];
-                #[cfg(not(windows))]
-                let candidates = vec![base];
-                candidates
-            })
-            .find(|path| path.is_file())
-    })
 }
 
 fn configure_logging(verbose: u8) -> Result<()> {

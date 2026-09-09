@@ -43,8 +43,8 @@ breaking change and give an explicit reset or migration procedure.
 1. Update `CHANGELOG.md` and the version in `Cargo.toml`.
 2. Run the full local verification commands above.
 3. Merge to `main`, then push the matching `vMAJOR.MINOR.PATCH` tag.
-4. The release workflow builds five native targets, creates SHA-256 checksums,
-   publishes a GitHub Release, and tests both installers against that release.
+4. The release workflow builds four macOS/Linux targets, creates SHA-256 checksums,
+   publishes a GitHub Release, and tests the installer against the built artifacts.
 
 Dependabot groups GitHub Actions updates because the upload and download
 actions form one release-artifact contract. Review major dependency updates

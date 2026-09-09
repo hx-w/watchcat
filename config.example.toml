@@ -1,5 +1,5 @@
 # Copy to the path printed by `watchcat config path`, or run `watchcat config init`.
-version = 3
+version = 4
 
 [engine]
 poll_interval_seconds = 10
@@ -9,14 +9,15 @@ log_retention = 10000
 # A target is removed from Watchcat only. The provider session is never deleted.
 [lifecycle]
 stale_after_seconds = 259200
-sweep_interval_seconds = 60
-protect_unresolved_failures = true
 
 [providers.codex]
 enabled = true
 command = ["codex", "app-server", "--listen", "stdio://"]
 
-# Prefer `watchcat policy set` over editing policy tables by hand.
+[providers.claude]
+enabled = true
+
+# Prefer `watchcat config policy set` over editing policy tables by hand.
 [policies."capacity.model_overloaded"]
 action = "retry"
 backoff = "exponential"

@@ -39,5 +39,5 @@ same user SID as Watchcat before sending any request.
 
 The Desktop protocol is versioned but not a public OpenAI API. Watchcat accepts
 only the method versions it implements and reports an error on incompatible
-responses. After updating Codex Desktop, run `watchcat doctor` before relying on
+responses. After updating Codex Desktop, run `watchcat service status` before relying on
 unattended recovery.

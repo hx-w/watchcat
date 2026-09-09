@@ -11,18 +11,21 @@ use serde::{Deserialize, Serialize};
 use crate::config::atomic_write;
 use crate::models::{EngineEvent, Failure, SessionLog, WatchTarget};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WatchlistDocument {
     version: u32,
     #[serde(default)]
     targets: Vec<WatchTarget>,
+    excluded: std::collections::BTreeSet<String>,
 }
 
 impl Default for WatchlistDocument {
     fn default() -> Self {
         Self {
-            version: 3,
+            version: 4,
             targets: Vec::new(),
+            excluded: Default::default(),
         }
     }
 }
@@ -37,126 +40,100 @@ impl WatchlistStore {
         Self { path }
     }
 
-    pub fn list(&self) -> Result<Vec<WatchTarget>> {
+    fn load(&self) -> Result<WatchlistDocument> {
         let document: WatchlistDocument = load_json_or_default(&self.path)?;
-        match document.version {
-            2 => self.save(document.targets.clone())?,
-            3 => {}
-            version => {
-                bail!(
-                    "unsupported watchlist version {version}; this release requires version 2 or 3"
-                )
-            }
+        if document.version != 4 {
+            bail!(
+                "unsupported watchlist version {}; this release requires version 4",
+                document.version
+            );
         }
-        Ok(document.targets)
+        Ok(document)
     }
 
-    pub fn replace(&self, targets: Vec<WatchTarget>) -> Result<()> {
-        self.save(targets)
+    pub fn list(&self) -> Result<Vec<WatchTarget>> {
+        Ok(self.load()?.targets)
     }
 
     pub fn add(&self, target: WatchTarget) -> Result<bool> {
-        let mut targets = self.list()?;
-        if targets
+        let mut document = self.load()?;
+        document.excluded.remove(&target.key());
+        let added = !document
+            .targets
             .iter()
-            .any(|existing| existing.key() == target.key())
-        {
-            return Ok(false);
-        }
-        targets.push(target);
-        self.save(targets)?;
-        Ok(true)
-    }
-
-    pub fn remove(&self, provider: &str, session_id: &str) -> Result<bool> {
-        let mut targets = self.list()?;
-        let original = targets.len();
-        targets.retain(|target| target.provider != provider || target.session_id != session_id);
-        if original == targets.len() {
-            return Ok(false);
-        }
-        self.save(targets)?;
-        Ok(true)
-    }
-
-    pub fn set_enabled(&self, provider: &str, session_id: &str, enabled: bool) -> Result<bool> {
-        self.update(provider, session_id, |target| target.enabled = enabled)
-    }
-
-    pub fn set_protected(&self, provider: &str, session_id: &str, protected: bool) -> Result<bool> {
-        self.update(provider, session_id, |target| target.protected = protected)
-    }
-
-    pub fn touch(
-        &self,
-        provider: &str,
-        session_id: &str,
-        timestamp: DateTime<Utc>,
-    ) -> Result<bool> {
-        self.update(provider, session_id, |target| {
-            target.last_event_at = Some(timestamp)
-        })
-    }
-
-    pub fn remove_stale(
-        &self,
-        now: DateTime<Utc>,
-        stale_after_seconds: i64,
-        unresolved: &HashSet<String>,
-    ) -> Result<Vec<WatchTarget>> {
-        let (targets, removed) = self.plan_stale_removal(now, stale_after_seconds, unresolved)?;
-        if !removed.is_empty() {
-            self.save(targets)?;
-        }
-        Ok(removed)
-    }
-
-    pub fn plan_stale_removal(
-        &self,
-        now: DateTime<Utc>,
-        stale_after_seconds: i64,
-        unresolved: &HashSet<String>,
-    ) -> Result<(Vec<WatchTarget>, Vec<WatchTarget>)> {
-        let mut targets = self.list()?;
-        let cutoff = now - Duration::seconds(stale_after_seconds);
-        let mut removed = Vec::new();
-        targets.retain(|target| {
-            let latest = target.last_event_at.unwrap_or(target.added_at);
-            let keep = target.protected || unresolved.contains(&target.key()) || latest >= cutoff;
-            if !keep {
-                removed.push(target.clone());
-            }
-            keep
-        });
-        Ok((targets, removed))
-    }
-
-    fn update(
-        &self,
-        provider: &str,
-        session_id: &str,
-        update: impl FnOnce(&mut WatchTarget),
-    ) -> Result<bool> {
-        let mut targets = self.list()?;
-        let Some(target) = targets
+            .any(|entry| entry.key() == target.key());
+        if let Some(existing) = document
+            .targets
             .iter_mut()
-            .find(|target| target.provider == provider && target.session_id == session_id)
-        else {
-            return Ok(false);
-        };
-        update(target);
-        self.save(targets)?;
-        Ok(true)
+            .find(|entry| entry.key() == target.key())
+        {
+            existing.added_at = target.added_at;
+            existing.source = crate::models::TrackingSource::Manual;
+            if target.label.is_some() {
+                existing.label = target.label;
+            }
+        } else {
+            document.targets.push(target);
+        }
+        save_json(&self.path, &document)?;
+        Ok(added)
     }
 
-    fn save(&self, targets: Vec<WatchTarget>) -> Result<()> {
-        save_json(
-            &self.path,
-            &WatchlistDocument {
-                version: 3,
-                targets,
-            },
-        )
+    pub fn remove(&self, key: &str) -> Result<bool> {
+        let mut document = self.load()?;
+        let original = document.targets.len();
+        document.targets.retain(|target| target.key() != key);
+        document.excluded.insert(key.into());
+        save_json(&self.path, &document)?;
+        Ok(original != document.targets.len())
+    }
+
+    /// Only provider activity extends membership. Manual removal persists until add.
+    pub fn reconcile(
+        &self,
+        sessions: &[crate::models::Session],
+        now: DateTime<Utc>,
+        stale_after_seconds: i64,
+        protected: &HashSet<String>,
+    ) -> Result<Vec<WatchTarget>> {
+        let mut document = self.load()?;
+        let previous = document.clone();
+        let cutoff = now - Duration::seconds(stale_after_seconds);
+        let mut positions = document
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.key(), i))
+            .collect::<HashMap<_, _>>();
+        for session in sessions {
+            if document.excluded.contains(&session.key()) {
+                continue;
+            }
+            if let Some(&index) = positions.get(&session.key()) {
+                let target = &mut document.targets[index];
+                target.title = Some(session.title.clone());
+                target.last_activity_at = target.last_activity_at.max(session.updated_at);
+            } else if session.updated_at.is_some_and(|updated| updated >= cutoff) {
+                positions.insert(session.key(), document.targets.len());
+                document.targets.push(WatchTarget {
+                    source: crate::models::TrackingSource::Automatic,
+                    provider: session.provider.clone(),
+                    session_id: session.id.clone(),
+                    label: None,
+                    title: Some(session.title.clone()),
+                    added_at: now,
+                    last_activity_at: session.updated_at,
+                });
+            }
+        }
+        document.targets.retain(|target| {
+            protected.contains(&target.key()) || target.inactivity_since(None) >= cutoff
+        });
+        let targets = document.targets.clone();
+        if document != previous {
+            save_json(&self.path, &document)?;
+        }
+        Ok(targets)
     }
 }
 
@@ -173,12 +150,6 @@ pub struct RuntimeState {
     pending_recoveries: HashMap<String, PendingRecovery>,
     #[serde(default)]
     recovery_outcomes: Vec<RecoveryOutcome>,
-    #[serde(default = "default_true")]
-    guard_enabled: bool,
-    #[serde(default)]
-    guard_paused_until: Option<DateTime<Utc>>,
-    #[serde(default)]
-    revision: u64,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -234,63 +205,21 @@ impl RuntimeState {
                 attempts: HashMap::new(),
                 pending_recoveries: HashMap::new(),
                 recovery_outcomes: Vec::new(),
-                guard_enabled: true,
-                guard_paused_until: None,
-                revision: 0,
                 path: PathBuf::new(),
             }
         };
-        let migrated = state.version == 2;
-        match state.version {
-            2 => state.version = 3,
-            3 => {}
-            version => bail!(
-                "unsupported runtime state version {version}; this release requires version 2 or 3"
-            ),
+        if state.version != 3 {
+            bail!(
+                "unsupported runtime state version {}; this release requires version 3",
+                state.version
+            );
         }
         state.path = path;
-        if migrated {
-            state.save()?;
-        }
         Ok(state)
     }
 
     pub fn save(&self) -> Result<()> {
         save_json(&self.path, self)
-    }
-
-    pub fn guard_state(&self) -> (bool, Option<DateTime<Utc>>) {
-        (self.guard_enabled, self.guard_paused_until)
-    }
-
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    pub fn set_guard_state(
-        &mut self,
-        enabled: bool,
-        paused_until: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        let previous = (self.guard_enabled, self.guard_paused_until);
-        self.guard_enabled = enabled;
-        self.guard_paused_until = paused_until;
-        if let Err(error) = self.save() {
-            self.guard_enabled = previous.0;
-            self.guard_paused_until = previous.1;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub fn next_revision(&mut self) -> Result<u64> {
-        let previous = self.revision;
-        self.revision = self.revision.saturating_add(1).max(1);
-        if let Err(error) = self.save() {
-            self.revision = previous;
-            return Err(error);
-        }
-        Ok(self.revision)
     }
 
     pub fn handled_action(&self, failure: &Failure) -> Option<&str> {
@@ -451,28 +380,22 @@ impl RuntimeState {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlStateStore {
     version: u32,
-    guard_enabled: bool,
-    #[serde(default)]
-    guard_paused_until: Option<DateTime<Utc>>,
     revision: u64,
     #[serde(skip)]
     path: PathBuf,
 }
 
 impl ControlStateStore {
-    pub fn load(
-        path: PathBuf,
-        legacy_guard: (bool, Option<DateTime<Utc>>),
-        legacy_revision: u64,
-    ) -> Result<Self> {
+    pub fn load(path: PathBuf) -> Result<Self> {
         if path.exists() {
             let bytes = fs::read(&path)
                 .with_context(|| format!("cannot read control state {}", path.display()))?;
             let mut state: Self = serde_json::from_slice(&bytes)
                 .with_context(|| format!("invalid control state {}", path.display()))?;
-            if state.version != 1 {
+            if state.version != 2 {
                 bail!("unsupported control state version {}", state.version);
             }
             state.path = path;
@@ -480,52 +403,12 @@ impl ControlStateStore {
             return Ok(state);
         }
         let mut state = Self {
-            version: 1,
-            guard_enabled: legacy_guard.0,
-            guard_paused_until: legacy_guard.1,
-            revision: legacy_revision,
+            version: 2,
+            revision: 0,
             path,
         };
         state.next_revision()?;
         Ok(state)
-    }
-
-    pub fn guard_state(&self) -> (bool, Option<DateTime<Utc>>) {
-        (self.guard_enabled, self.guard_paused_until)
-    }
-
-    pub fn set_guard_state(
-        &mut self,
-        enabled: bool,
-        paused_until: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        let previous = (self.guard_enabled, self.guard_paused_until);
-        self.guard_enabled = enabled;
-        self.guard_paused_until = paused_until;
-        if let Err(error) = self.save() {
-            self.guard_enabled = previous.0;
-            self.guard_paused_until = previous.1;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub fn set_guard_state_and_advance(
-        &mut self,
-        enabled: bool,
-        paused_until: Option<DateTime<Utc>>,
-    ) -> Result<u64> {
-        let previous = (self.guard_enabled, self.guard_paused_until, self.revision);
-        self.guard_enabled = enabled;
-        self.guard_paused_until = paused_until;
-        self.revision = self.revision.saturating_add(1).max(1);
-        if let Err(error) = self.save() {
-            self.guard_enabled = previous.0;
-            self.guard_paused_until = previous.1;
-            self.revision = previous.2;
-            return Err(error);
-        }
-        Ok(self.revision)
     }
 
     pub fn revision(&self) -> u64 {
@@ -545,10 +428,6 @@ impl ControlStateStore {
     fn save(&self) -> Result<()> {
         save_json(&self.path, self)
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Clone)]
@@ -663,7 +542,7 @@ impl ProcessLock {
     pub fn acquire(path: PathBuf) -> Result<Self> {
         let parent = path
             .parent()
-            .context("runner lock has no parent directory")?;
+            .context("service lock has no parent directory")?;
         fs::create_dir_all(parent)?;
         let file = OpenOptions::new()
             .create(true)
@@ -671,9 +550,9 @@ impl ProcessLock {
             .read(true)
             .write(true)
             .open(&path)
-            .with_context(|| format!("cannot open runner lock {}", path.display()))?;
+            .with_context(|| format!("cannot open service lock {}", path.display()))?;
         file.try_lock_exclusive()
-            .with_context(|| "another watchcat runner is active")?;
+            .with_context(|| "another Watchcat process owns this state directory")?;
         file.set_len(0)?;
         (&file).write_all(std::process::id().to_string().as_bytes())?;
         Ok(Self { file })
@@ -709,23 +588,108 @@ mod tests {
 
     fn target(id: &str) -> WatchTarget {
         WatchTarget {
+            source: crate::models::TrackingSource::Manual,
             provider: "codex".into(),
             session_id: id.into(),
-            enabled: true,
-            protected: false,
             label: None,
+            title: None,
             added_at: Utc::now(),
-            last_event_at: None,
+            last_activity_at: None,
         }
     }
 
     #[test]
-    fn watchlist_add_is_idempotent() {
+    fn discovering_recent_history_does_not_extend_its_inactivity_window() {
         let directory = tempfile::tempdir().unwrap();
         let store = WatchlistStore::new(directory.path().join("watchlist.json"));
-        assert!(store.add(target("one")).unwrap());
-        assert!(!store.add(target("one")).unwrap());
-        assert_eq!(store.list().unwrap().len(), 1);
+        let now = Utc::now();
+        let session = crate::models::Session {
+            provider: "codex".into(),
+            id: "recent-history".into(),
+            title: "Old work".into(),
+            state: crate::models::SessionState::Idle,
+            updated_at: Some(now - Duration::hours(71)),
+            metadata: serde_json::Value::Null,
+        };
+        assert_eq!(
+            store
+                .reconcile(std::slice::from_ref(&session), now, 259200, &HashSet::new())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .reconcile(
+                    &[session],
+                    now + Duration::hours(2),
+                    259200,
+                    &HashSet::new()
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn discovery_expiry_reactivation_and_manual_exclusion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("watchlist.json");
+        let store = WatchlistStore::new(path.clone());
+        let now = Utc::now();
+        let mut session = crate::models::Session {
+            provider: "codex".into(),
+            id: "new".into(),
+            title: "New work".into(),
+            state: crate::models::SessionState::Idle,
+            updated_at: Some(now),
+            metadata: serde_json::Value::Null,
+        };
+        let reconcile = |store: &WatchlistStore, session: &crate::models::Session, time| {
+            store
+                .reconcile(std::slice::from_ref(session), time, 259200, &HashSet::new())
+                .unwrap()
+        };
+        assert_eq!(reconcile(&store, &session, now).len(), 1);
+        assert!(reconcile(&store, &session, now + Duration::days(4)).is_empty());
+        session.updated_at = Some(now + Duration::days(4));
+        assert_eq!(
+            reconcile(&store, &session, now + Duration::days(4)).len(),
+            1
+        );
+        store.remove(&session.key()).unwrap();
+        let reopened = WatchlistStore::new(path);
+        assert!(reconcile(&reopened, &session, now + Duration::days(4)).is_empty());
+        let mut manual = target("new");
+        manual.added_at = now + Duration::days(4);
+        reopened.add(manual).unwrap();
+        assert_eq!(
+            reconcile(&reopened, &session, now + Duration::days(4)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_discovery_preserves_membership_without_extending_activity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = WatchlistStore::new(directory.path().join("watchlist.json"));
+        let now = Utc::now();
+        let mut old = target("offline");
+        old.added_at = now - Duration::days(4);
+        old.last_activity_at = Some(old.added_at);
+        store.add(old.clone()).unwrap();
+        assert_eq!(
+            store
+                .reconcile(&[], now, 259200, &HashSet::from([old.key()]))
+                .unwrap(),
+            vec![old]
+        );
+        assert!(
+            store
+                .reconcile(&[], now, 259200, &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -737,91 +701,43 @@ mod tests {
     }
 
     #[test]
-    fn version_two_watchlist_migrates_without_losing_targets() {
+    fn obsolete_state_is_rejected_without_rewriting() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("watchlist.json");
-        fs::write(
-            &path,
-            format!(
-                r#"{{"version":2,"targets":[{{"provider":"codex","session_id":"one","enabled":true,"label":null,"added_at":"{}"}}]}}"#,
-                Utc::now().to_rfc3339()
-            ),
-        )
-        .unwrap();
-
-        let targets = WatchlistStore::new(path.clone()).list().unwrap();
-        assert_eq!(targets.len(), 1);
-        assert!(!targets[0].protected);
-        let document: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(document["version"], 3);
-    }
-
-    #[test]
-    fn stale_cleanup_keeps_protected_unresolved_and_recent_targets() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = WatchlistStore::new(directory.path().join("watchlist.json"));
-        let now = Utc::now();
-        let mut old = target("old");
-        old.added_at = now - Duration::days(4);
-        let mut protected = target("protected");
-        protected.added_at = now - Duration::days(4);
-        protected.protected = true;
-        let mut unresolved = target("unresolved");
-        unresolved.added_at = now - Duration::days(4);
-        let mut recent = target("recent");
-        recent.added_at = now - Duration::days(4);
-        recent.last_event_at = Some(now - Duration::days(1));
-        for item in [old, protected, unresolved.clone(), recent] {
-            store.add(item).unwrap();
+        for version in [1, 2, 5] {
+            let path = directory.path().join("state.json");
+            let data = format!(r#"{{"version":{version},"targets":[]}}"#);
+            fs::write(&path, &data).unwrap();
+            assert!(WatchlistStore::new(path.clone()).list().is_err());
+            assert!(RuntimeState::load(path.clone()).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), data);
         }
-
-        let removed = store
-            .remove_stale(now, 3 * 86_400, &HashSet::from([unresolved.key()]))
-            .unwrap();
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].session_id, "old");
-        let remaining = store
-            .list()
-            .unwrap()
-            .into_iter()
-            .map(|item| item.session_id)
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            remaining,
-            HashSet::from(["protected".into(), "unresolved".into(), "recent".into()])
-        );
     }
 
     #[test]
-    fn control_state_persists_guard_and_monotonic_revision() {
+    fn control_state_persists_monotonic_revision() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.json");
-        let mut first = ControlStateStore::load(path.clone(), (true, None), 7).unwrap();
-        assert_eq!(first.revision(), 8);
-        assert_eq!(first.set_guard_state_and_advance(false, None).unwrap(), 9);
+        let mut first = ControlStateStore::load(path.clone()).unwrap();
+        assert_eq!(first.revision(), 1);
+        assert_eq!(first.next_revision().unwrap(), 2);
         drop(first);
 
-        let mut reopened = ControlStateStore::load(path, (true, None), 0).unwrap();
-        assert_eq!(reopened.guard_state(), (false, None));
-        assert_eq!(reopened.revision(), 10);
-        assert_eq!(reopened.next_revision().unwrap(), 11);
+        let mut reopened = ControlStateStore::load(path).unwrap();
+        assert_eq!(reopened.revision(), 3);
+        assert_eq!(reopened.next_revision().unwrap(), 4);
     }
 
     #[test]
     fn control_state_rolls_back_memory_when_persistence_fails() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.json");
-        let mut state = ControlStateStore::load(path.clone(), (true, None), 4).unwrap();
+        let mut state = ControlStateStore::load(path.clone()).unwrap();
         let revision = state.revision();
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
 
         assert!(state.next_revision().is_err());
         assert_eq!(state.revision(), revision);
-        assert!(state.set_guard_state(false, None).is_err());
-        assert_eq!(state.guard_state(), (true, None));
-        assert!(state.set_guard_state_and_advance(false, None).is_err());
-        assert_eq!(state.guard_state(), (true, None));
         assert_eq!(state.revision(), revision);
     }
 
