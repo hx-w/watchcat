@@ -186,36 +186,39 @@ impl ClaudeProvider {
                 if uuid::Uuid::parse_str(id).is_err() {
                     continue;
                 }
-                let metadata = entry.metadata()?;
-                let modified = metadata.modified().ok();
-                #[cfg(unix)]
-                let identity = {
-                    use std::os::unix::fs::MetadataExt;
-                    (metadata.dev(), metadata.ino())
-                };
-                #[cfg(not(unix))]
-                let identity = (0, 0);
                 seen.insert(path.clone());
                 let cached = self.transcripts.entry(path.clone()).or_insert_with(|| Transcript {
-                    offset: 0, modified: None, identity, uncertain: false,
+                    offset: 0, modified: None, identity: (0, 0), uncertain: false,
                     session: Session { provider: "claude".into(), id: id.into(), title: id.into(),
                         state: SessionState::Unknown, updated_at: None,
                         metadata: serde_json::json!({"capabilities": ["discover", "logs"], "transcript": path}),
                     },
                 });
-                if cached.identity == identity
-                    && cached.modified == modified
-                    && cached.offset == metadata.len()
-                {
-                    continue;
-                }
-                if cached.identity != identity || metadata.len() <= cached.offset {
-                    cached.offset = 0;
-                    cached.identity = identity;
-                    cached.session.updated_at = None;
-                }
                 let refreshed: Result<()> = (|| {
-                    let mut reader = BufReader::new(File::open(&path)?);
+                    let file = File::open(&path)?;
+                    // Directory entries can report stale sizes while a writer is open.
+                    // Inspect and read the same handle so appends are visible immediately.
+                    let metadata = file.metadata()?;
+                    let modified = metadata.modified().ok();
+                    #[cfg(unix)]
+                    let identity = {
+                        use std::os::unix::fs::MetadataExt;
+                        (metadata.dev(), metadata.ino())
+                    };
+                    #[cfg(not(unix))]
+                    let identity = (0, 0);
+                    if cached.identity == identity
+                        && cached.modified == modified
+                        && cached.offset == metadata.len()
+                    {
+                        return Ok(());
+                    }
+                    if cached.identity != identity || metadata.len() <= cached.offset {
+                        cached.offset = 0;
+                        cached.identity = identity;
+                        cached.session.updated_at = None;
+                    }
+                    let mut reader = BufReader::new(file);
                     reader.seek(SeekFrom::Start(cached.offset))?;
                     let mut line = String::new();
                     loop {
