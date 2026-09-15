@@ -132,7 +132,8 @@ impl Log {
     }
 }
 
-#[cfg(test)]
+// The event log is written by the macOS/Linux daemon; Windows has no service.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
