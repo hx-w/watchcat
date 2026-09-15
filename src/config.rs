@@ -39,6 +39,7 @@ pub struct Settings {
     pub lifecycle: LifecycleSettings,
     pub providers: ProviderSettings,
     pub policies: BTreeMap<String, PolicyOverride>,
+    pub dialogs: crate::os_permissions::rules::DialogSettings,
 }
 
 fn missing_version() -> u32 {
@@ -53,6 +54,7 @@ impl Default for Settings {
             lifecycle: LifecycleSettings::default(),
             providers: ProviderSettings::default(),
             policies: BTreeMap::new(),
+            dialogs: Default::default(),
         }
     }
 }
@@ -174,6 +176,7 @@ impl Settings {
             self.providers.codex.enabled,
             &self.providers.codex.command,
         )?;
+        self.dialogs.validate()?;
         for (condition, policy) in &self.policies {
             if !is_known(condition) {
                 bail!("unknown policy condition: {condition}");

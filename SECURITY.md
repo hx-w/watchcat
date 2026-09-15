@@ -24,7 +24,11 @@ On macOS, running the service with Accessibility permission also authorizes
 automatic acceptance of recognized OS directory/volume access dialogs across
 the current user's desktop, independently of session membership. The monitor
 checks the UI host's actual system executable path, recognizes the permission
-request, and presses its enabled Allow button. It does not grant itself
+request, and presses its enabled Allow button. Custom window rules also authorize
+the exact configured button for matching app/window selectors. Bundle IDs are
+application metadata, not a signing identity; use an executable path when a
+precise installation must be selected. Only one rule and one enabled button may
+match; editable or credential fields prevent a click. It does not grant itself
 Accessibility access or edit the TCC database. Service stop revokes future
 clicks; it does not revoke directory access already granted by macOS.
 

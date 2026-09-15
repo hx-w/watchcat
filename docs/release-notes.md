@@ -1,18 +1,21 @@
-Watchcat 0.6.0 adds event-driven handling of recognized macOS directory and
-volume permission dialogs. While the service runs, it subscribes to system
-application and Accessibility events and presses Allow on supported requests,
-including removable and network volumes. No new configuration or periodic
-desktop scan is needed. Service status shows readiness and the latest result.
+Watchcat 0.7.0 adds configurable macOS window click rules through
+`watchcat config dialog`. Match an app, window title or primary text, and button;
+changes take effect immediately. The built-in directory and volume permission
+rule remains enabled by default. `watchcat service logs` shows persistent events
+with local timestamps, app, rule, button, and click outcomes; use `--clicks` to
+filter actions or `--json` for structured output.
 
-Grant the installed `watchcatd` executable Accessibility access once in System
-Settings, then restart the service. This applies across the current desktop,
-including apps outside the session watchlist. Recognition uses known English
-and Chinese directory-consent headings; passwords and unrelated permission
-categories are excluded. Live macOS permission prompts have not yet been
-verified, and other languages or system dialog layouts may remain unhandled.
+The monitor now observes new background and LSUIElement applications as well as
+ordinary app launches. Transient Accessibility subscription failures receive
+bounded retries, and activation or wake events can recover unavailable hosts.
+Discovery uses event subscriptions without periodic desktop scans. Interrupted
+log writes no longer corrupt subsequent records.
 
-Upgrade `watchcat` and `watchcatd` together. Existing 0.5.0 configuration and state
-remain compatible, and Linux behavior is unchanged. Stopping the service stops
-further clicks; permissions already granted remain granted.
+Upgrade `watchcat` and `watchcatd` together. Existing 0.6.0 configuration and state
+remain compatible, and Linux behavior is unchanged. Configuration containing the
+new `[dialogs]` section requires 0.7.0 or later; restore an older configuration
+backup before downgrading. Check Accessibility access for the installed
+`watchcatd` after replacing it, then restart the service. Live macOS permission
+prompts have not yet been verified; unrecognized dialog layouts remain unhandled.
 
-**Full Changelog**: https://github.com/hx-w/watchcat/compare/v0.5.0...v0.6.0
+**Full Changelog**: https://github.com/hx-w/watchcat/compare/v0.6.0...v0.7.0

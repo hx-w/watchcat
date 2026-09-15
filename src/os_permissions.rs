@@ -1,5 +1,8 @@
 //! Desktop permission handling is independent of provider/session recovery.
-//! The service lifecycle is its only switch; no per-app or per-directory setup.
+//! Rules are configured through the same daemon control plane as recovery policies.
+
+pub mod events;
+pub mod rules;
 
 use std::sync::Mutex;
 
@@ -14,6 +17,8 @@ pub use macos::run_main;
 pub struct Status {
     pub state: String,
     pub listening_processes: usize,
+    #[serde(default)]
+    pub unavailable_processes: usize,
     pub clicks_sent: usize,
     pub dialogs_closed: usize,
     pub last_result: Option<String>,
@@ -52,13 +57,80 @@ pub struct Guard {
     inner: macos::Guard,
 }
 
-pub fn start(dry_run: bool) -> Guard {
+static RULES: Mutex<Option<rules::DialogSettings>> = Mutex::new(None);
+static LOG: Mutex<Option<events::Log>> = Mutex::new(None);
+
+pub fn configure(settings: rules::DialogSettings) {
+    let enabled = settings.rules.values().filter(|rule| rule.enabled).count();
+    *RULES.lock().unwrap_or_else(|e| e.into_inner()) = Some(settings);
+    record(
+        "rules.updated",
+        None,
+        "watchcatd",
+        None,
+        None,
+        &format!("{enabled} enabled rules; disabled/removed rules cannot authorize further clicks"),
+    );
+    #[cfg(target_os = "macos")]
+    macos::configuration_changed();
+}
+
+fn record(
+    kind: &str,
+    pid: Option<i32>,
+    app: &str,
+    rule: Option<&str>,
+    button: Option<&str>,
+    detail: &str,
+) -> bool {
+    let event = events::Event {
+        timestamp: chrono::Utc::now(),
+        kind: kind.into(),
+        pid,
+        app: app.chars().filter(|c| !c.is_control()).take(512).collect(),
+        rule: rule.map(str::to_owned),
+        button: button.map(|text| text.chars().filter(|c| !c.is_control()).take(512).collect()),
+        detail: detail.into(),
+    };
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(log) = log.as_mut() else {
+        return false;
+    };
+    if let Err(error) = log.append(&event) {
+        tracing::warn!(%error, "cannot write dialog event log");
+        return false;
+    }
+    true
+}
+
+pub fn start(
+    dry_run: bool,
+    paths: &crate::config::Paths,
+    settings: &crate::config::Settings,
+) -> anyhow::Result<Guard> {
+    *LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(events::Log::new(
+        events::path(&paths.socket_file),
+        settings.engine.log_retention,
+    )?);
+    configure(settings.dialogs.clone());
+    record(
+        "monitor.started",
+        None,
+        "watchcatd",
+        None,
+        None,
+        if dry_run {
+            "dry run; no clicks"
+        } else {
+            "event subscriptions starting"
+        },
+    );
     #[cfg(not(target_os = "macos"))]
     let _ = dry_run;
-    Guard {
+    Ok(Guard {
         #[cfg(target_os = "macos")]
         inner: macos::start(dry_run),
-    }
+    })
 }
 
 impl Guard {
@@ -68,7 +140,6 @@ impl Guard {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn is_file_access_request(text: &str) -> bool {
     // Only a complete consent heading qualifies. Do not search arbitrary
     // descriptions or application names for a directory-related substring.

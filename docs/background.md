@@ -61,8 +61,9 @@ Logs are `watchcatd.log` and `watchcatd.err.log` in the state directory reported
 by `watchcat config path`. launchd restarts an exited server with a 10-second
 throttle. Log files are not automatically rotated.
 
-macOS directory permission handling uses this same LaunchAgent, with no extra
-service or configuration. Add the actual installed `watchcatd` binary (normally
+macOS window rules use this same LaunchAgent. Configure them with
+`watchcat config dialog`; read their persistent event history with
+`watchcat service logs` or `watchcat service logs --clicks`. Add the actual installed `watchcatd` binary (normally
 `~/.local/bin/watchcatd`) to Privacy & Security → Accessibility and restart the
 service. `watchcat service status` shows the permission/observer state and most
 recent result. Without that permission the session watchdog still runs, but OS

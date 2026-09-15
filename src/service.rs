@@ -23,6 +23,16 @@ pub enum ServiceCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show persistent OS dialog events, including automatic click timestamps.
+    Logs {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        limit: u32,
+        /// Show click attempts and their results only.
+        #[arg(long)]
+        clicks: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop and unregister the service, preserving configuration and state.
     Uninstall,
 }
@@ -182,7 +192,7 @@ mod supported {
                 stop()?;
                 start(&path)
             }
-            ServiceCommand::Status { .. } => unreachable!(),
+            ServiceCommand::Status { .. } | ServiceCommand::Logs { .. } => unreachable!(),
             ServiceCommand::Uninstall => {
                 if !path.is_file() {
                     bail!("service is not installed at {}", path.display());

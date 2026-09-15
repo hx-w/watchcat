@@ -967,3 +967,117 @@ esac
         "restart did not bootstrap the unloaded service"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn dialog_rules_persist_and_logs_remain_readable_offline() {
+    let isolated = Isolated::new();
+    let daemon = isolated.start_daemon();
+    isolated
+        .command()
+        .args(["config", "dialog", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("directory-access"));
+    isolated
+        .command()
+        .args([
+            "config",
+            "dialog",
+            "set",
+            "helper",
+            "--app",
+            "org.example.Helper",
+            "--title",
+            "Ready",
+            "--button",
+            "Continue",
+        ])
+        .assert()
+        .success();
+    isolated
+        .command()
+        .args(["config", "dialog", "disable", "helper"])
+        .assert()
+        .success();
+    isolated
+        .command()
+        .args([
+            "config",
+            "dialog",
+            "set",
+            "too-broad",
+            "--app",
+            "org.example.Helper",
+            "--button",
+            "Continue",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("title or text"));
+    let config = isolated.directory.path().join("config/config.toml");
+    let settings = watchcat::config::load_settings(&config).unwrap();
+    assert!(!settings.dialogs.rules["helper"].enabled);
+    assert!(!settings.dialogs.rules.contains_key("too-broad"));
+    drop(daemon);
+    let daemon = isolated.start_daemon();
+    let output = isolated
+        .command()
+        .args(["config", "dialog", "list", "--json"])
+        .output()
+        .unwrap();
+    let rules: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rules["rules"]["helper"]["enabled"], false);
+    isolated
+        .command()
+        .args(["config", "dialog", "remove", "helper"])
+        .assert()
+        .success();
+    drop(daemon);
+    isolated
+        .command()
+        .args(["service", "logs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rules.updated"))
+        .stdout(predicate::str::contains("TIME"));
+    isolated
+        .command()
+        .args(["service", "logs", "--clicks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No automatic clicks recorded"));
+    let events = isolated
+        .command()
+        .args(["service", "logs", "--json"])
+        .output()
+        .unwrap();
+    let events: Value = serde_json::from_slice(&events.stdout).unwrap();
+    assert!(
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "monitor.started" && e["timestamp"].is_string())
+    );
+}
+
+#[test]
+fn click_log_cli_shows_timestamp_rule_button_and_outcome_without_a_daemon() {
+    let isolated = Isolated::new();
+    let state = isolated.directory.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    // Synthetic audit fixture: no desktop actions are executed by this test.
+    let event = serde_json::json!({"timestamp":"2026-09-15T08:00:00Z", "kind":"click.sent", "pid":123,
+        "app":"org.example.Helper", "rule":"helper", "button":"Continue", "detail":"waiting for window to close"});
+    std::fs::write(state.join("dialog-events.jsonl"), format!("{event}\n")).unwrap();
+    isolated
+        .command()
+        .args(["service", "logs", "--clicks"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2026-09-15"))
+        .stdout(predicate::str::contains("click.sent"))
+        .stdout(predicate::str::contains("Continue"))
+        .stdout(predicate::str::contains("helper"));
+}

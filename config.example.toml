@@ -25,3 +25,12 @@ initial_delay_seconds = 15
 max_delay_seconds = 300
 max_attempts = 5
 prompt = "The {model} model is overloaded. Continue the unfinished task. Attempt {attempt}/{max_attempts}."
+
+# Built-in directory consent rule. Custom rules require app, button, and title or text.
+[dialogs.rules.directory-access]
+enabled = true
+
+# [dialogs.rules.helper-ready]
+# app = "org.example.Helper"
+# title = "Ready to continue"
+# button = "Continue"

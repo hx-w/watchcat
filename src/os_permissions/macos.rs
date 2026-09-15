@@ -14,15 +14,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use block2::RcBlock;
 use objc2::{
-    MainThreadMarker,
+    AnyThread, MainThreadMarker, define_class, msg_send,
     rc::{Retained, autoreleasepool},
-    runtime::ProtocolObject,
+    runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSRunningApplication, NSWorkspace, NSWorkspaceDidActivateApplicationNotification,
-    NSWorkspaceDidLaunchApplicationNotification, NSWorkspaceDidTerminateApplicationNotification,
-    NSWorkspaceDidUnhideApplicationNotification, NSWorkspaceDidWakeNotification,
-    NSWorkspaceSessionDidBecomeActiveNotification,
+    NSRunningApplication, NSWorkspace, NSWorkspaceApplicationKey,
+    NSWorkspaceDidActivateApplicationNotification, NSWorkspaceDidLaunchApplicationNotification,
+    NSWorkspaceDidTerminateApplicationNotification, NSWorkspaceDidUnhideApplicationNotification,
+    NSWorkspaceDidWakeNotification, NSWorkspaceSessionDidBecomeActiveNotification,
 };
 use objc2_application_services::{AXError, AXIsProcessTrusted, AXObserver, AXUIElement};
 use objc2_core_foundation::Type;
@@ -30,10 +30,15 @@ use objc2_core_foundation::{
     CFAbsoluteTimeGetCurrent, CFArray, CFBoolean, CFRetained, CFRunLoop, CFRunLoopSource,
     CFRunLoopSourceContext, CFRunLoopTimer, CFString, CFType, kCFRunLoopDefaultMode,
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol};
+use objc2_foundation::{
+    NSDictionary, NSKeyValueChangeKey, NSKeyValueObservingOptions, NSNotification,
+    NSNotificationCenter, NSObject, NSObjectNSKeyValueObserverRegistration, NSObjectProtocol,
+    NSString, ns_string,
+};
 use tracing::{debug, info, warn};
 
-use super::{is_allow_button, is_file_access_request, update_status};
+use super::rules::{DIRECTORY_RULE, DialogSettings};
+use super::{RULES, is_allow_button, record, update_status};
 
 static MAIN_RUNNING: AtomicBool = AtomicBool::new(false);
 thread_local! {
@@ -175,7 +180,60 @@ unsafe extern "C-unwind" fn ax_event(
     queue_scan(context as isize as i32);
 }
 
+// NSWorkspace launch notifications omit background/LSUIElement applications.
+// KVO on runningApplications is the documented subscription for those hosts.
+define_class!(
+    #[unsafe(super(NSObject))]
+    struct ApplicationsObserver;
+    impl ApplicationsObserver {
+        #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+        fn changed(&self, _key: Option<&NSString>, _object: Option<&AnyObject>,
+            _change: Option<&NSDictionary<NSKeyValueChangeKey, AnyObject>>, _context: *mut c_void) {
+            // No Cocoa object crosses threads; enqueue before touching monitor state.
+            #[cfg(test)]
+            KVO_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+            if MAIN_RUNNING.load(Ordering::Acquire) { on_main(|| queue_scan(0)); }
+        }
+    }
+    unsafe impl NSObjectProtocol for ApplicationsObserver {}
+);
+
+pub(super) fn configuration_changed() {
+    if MAIN_RUNNING.load(Ordering::Acquire) {
+        on_main(|| {
+            MONITOR.with(|monitor| {
+                if let Some(monitor) = monitor.borrow_mut().as_mut() {
+                    monitor.failed.clear();
+                    for process in monitor.processes.values_mut() {
+                        for dialog in &mut process.dialogs {
+                            dialog.last_observation = None;
+                        }
+                    }
+                }
+            });
+            queue_scan(0);
+        });
+    }
+}
+
+struct PendingProcess {
+    app: Retained<NSRunningApplication>,
+    attempts: usize,
+    timer: Option<CFRetained<CFRunLoopTimer>>,
+}
+impl Drop for PendingProcess {
+    fn drop(&mut self) {
+        if let Some(timer) = &self.timer {
+            timer.invalidate();
+        }
+    }
+}
+
 struct Monitor {
+    workspace: Retained<NSWorkspace>,
+    applications_observer: Retained<ApplicationsObserver>,
+    failed: HashMap<i32, PendingProcess>,
+    initialized: bool,
     center: Retained<NSNotificationCenter>,
     tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     processes: HashMap<i32, Process>,
@@ -190,7 +248,18 @@ impl Monitor {
         unsafe {
             AXUIElement::new_system_wide().set_messaging_timeout(0.25);
         }
-        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        let workspace = NSWorkspace::sharedWorkspace();
+        let applications_observer: Retained<ApplicationsObserver> =
+            unsafe { msg_send![ApplicationsObserver::alloc(), init] };
+        unsafe {
+            workspace.addObserver_forKeyPath_options_context(
+                &applications_observer,
+                ns_string!("runningApplications"),
+                NSKeyValueObservingOptions::empty(),
+                std::ptr::null_mut(),
+            );
+        }
+        let center = workspace.notificationCenter();
         let mut tokens = Vec::new();
         // Launch/unhide/activation also cover a host whose AX server was not
         // ready at launch. Wake/session events re-establish dropped observers.
@@ -204,25 +273,36 @@ impl Monitor {
                 (NSWorkspaceSessionDidBecomeActiveNotification, true),
             ]
         } {
-            let callback = RcBlock::new(move |_: NonNull<NSNotification>| {
+            let callback = RcBlock::new(move |notification: NonNull<NSNotification>| {
+                let pid = unsafe { notification.as_ref() }
+                    .userInfo()
+                    .and_then(|info| {
+                        info.objectForKey(unsafe { NSWorkspaceApplicationKey }.as_ref())
+                    })
+                    .and_then(|app| app.downcast::<NSRunningApplication>().ok())
+                    .map(|app| app.processIdentifier());
                 on_main(move || {
-                    if reset {
-                        MONITOR.with(|monitor| {
-                            if let Some(monitor) = monitor.borrow_mut().as_mut() {
+                    MONITOR.with(|monitor| {
+                        if let Some(monitor) = monitor.borrow_mut().as_mut() {
+                            reset_failed(&mut monitor.failed, pid, reset);
+                            if reset {
                                 monitor.reconnect();
                             }
-                        });
-                    }
+                        }
+                    });
                     queue_scan(0);
                 });
             });
-            // No object filter or operation queue; the callback captures only
-            // a bool and forwards work onto the main run loop.
+            // Copy only the PID and reset flag onto the main run loop.
             tokens.push(unsafe {
                 center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &callback)
             });
         }
         Self {
+            workspace,
+            applications_observer,
+            failed: HashMap::new(),
+            initialized: false,
             center,
             tokens,
             processes: HashMap::new(),
@@ -236,10 +316,12 @@ impl Monitor {
         // permission. Grant once in Settings; activation then retries setup.
         if !unsafe { AXIsProcessTrusted() } {
             self.processes.clear();
+            self.failed.clear();
             let previous = super::status().state;
             update_status(|status| {
                 status.state = "accessibility_required".into();
                 status.listening_processes = 0;
+                status.unavailable_processes = 0;
                 status.last_result = std::env::current_exe().ok().map(|path| {
                     format!(
                         "Enable Accessibility for {} and restart the service",
@@ -248,45 +330,89 @@ impl Monitor {
                 });
             });
             if previous != "accessibility_required" {
+                record(
+                    "monitor.permission_required",
+                    None,
+                    "watchcatd",
+                    None,
+                    None,
+                    "Grant Accessibility to watchcatd and restart",
+                );
                 warn!(
                     "OS dialog handling needs Accessibility permission for watchcatd; grant it in System Settings > Privacy & Security > Accessibility, then restart the service"
                 );
             }
             return;
         }
-        self.processes.retain(|_, process| {
-            if !process.app.isTerminated() {
-                return true;
+        let rules = RULES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default();
+        self.processes.retain(|&pid, process| {
+            let keep = !process.app.isTerminated()
+                && app_identity(&process.app)
+                    .is_some_and(|(path, bundle)| rules.observes(&path, &bundle));
+            if !keep {
+                record(
+                    "process.detached",
+                    Some(pid),
+                    &app_name(&process.app),
+                    None,
+                    None,
+                    "process exited or no enabled rule applies",
+                );
+                for dialog in &process.dialogs {
+                    if dialog.awaiting_close {
+                        record(
+                            "click.unconfirmed",
+                            Some(pid),
+                            &app_name(&process.app),
+                            dialog.last_rule.as_deref(),
+                            dialog.last_button.as_deref(),
+                            "host exited or rule removed before close was confirmed",
+                        );
+                    }
+                }
             }
-            if process.dialogs.iter().any(|dialog| dialog.awaiting_close) {
-                update_status(|status| {
-                    status.last_result =
-                        Some("System UI host exited after Allow; result unconfirmed".into())
-                });
-            }
-            false
+            keep
         });
-        let mut incomplete = false;
-        for app in NSWorkspace::sharedWorkspace()
-            .runningApplications()
-            .to_vec()
-        {
+        self.failed.retain(|_, pending| {
+            !pending.app.isTerminated()
+                && app_identity(&pending.app)
+                    .is_some_and(|(path, bundle)| rules.observes(&path, &bundle))
+        });
+        for app in self.workspace.runningApplications().to_vec() {
+            if !*self.permit.lock().unwrap_or_else(|e| e.into_inner()) {
+                return;
+            }
             let pid = app.processIdentifier();
-            if self.processes.contains_key(&pid) || !is_system_host(pid) {
+            if self.processes.contains_key(&pid)
+                || self.failed.contains_key(&pid)
+                || app.isTerminated()
+                || !app_identity(&app).is_some_and(|(path, bundle)| rules.observes(&path, &bundle))
+            {
                 continue;
             }
-            match Process::new(app) {
-                Ok(process) => {
-                    self.processes.insert(pid, process);
-                }
-                Err(error) => {
-                    incomplete = true;
-                    debug!(pid, ?error, "system UI host cannot be observed");
-                }
-            }
+            record(
+                "process.discovered",
+                Some(pid),
+                &app_name(&app),
+                None,
+                None,
+                if self.initialized {
+                    "new process from application-list event; installing window observer"
+                } else {
+                    "initial application snapshot; installing window observer"
+                },
+            );
+            self.attach(app, 0);
         }
+        self.initialized = true;
+        let incomplete = !self.failed.is_empty();
         update_status(|status| {
             status.listening_processes = self.processes.len();
+            status.unavailable_processes = self.failed.len();
             status.state = if incomplete {
                 "partial"
             } else if self.dry_run {
@@ -302,6 +428,92 @@ impl Monitor {
         // is exclusively driven by Cocoa/AX events or a click's one-shot deadline.
         for &pid in self.processes.keys() {
             queue_scan(pid);
+        }
+    }
+
+    fn attach(&mut self, app: Retained<NSRunningApplication>, previous_attempts: usize) {
+        let pid = app.processIdentifier();
+        match Process::new(app.clone()) {
+            Ok(process) => {
+                self.failed.remove(&pid);
+                record(
+                    "process.observed",
+                    Some(pid),
+                    &app_name(&app),
+                    None,
+                    None,
+                    &format!(
+                        "subscribed: {}; initial window check",
+                        process.subscriptions.join(", ")
+                    ),
+                );
+                self.processes.insert(pid, process);
+                queue_scan(pid);
+            }
+            Err(error) => {
+                let attempts = previous_attempts + 1;
+                let timer = if attempts < 4
+                    && matches!(error, AXError::CannotComplete | AXError::InvalidUIElement)
+                {
+                    let callback = RcBlock::new(move |_: *mut CFRunLoopTimer| {
+                        on_main(move || {
+                            MONITOR.with(|monitor| {
+                                if let Some(monitor) = monitor.borrow_mut().as_mut() {
+                                    if let Some(pending) = monitor.failed.remove(&pid) {
+                                        if !pending.app.isTerminated()
+                                            && *monitor
+                                                .permit
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                        {
+                                            monitor.attach(pending.app.clone(), pending.attempts);
+                                        }
+                                    }
+                                }
+                            });
+                            queue_scan(0);
+                        });
+                    });
+                    let timer = unsafe {
+                        CFRunLoopTimer::with_handler(
+                            None,
+                            CFAbsoluteTimeGetCurrent() + [0.25, 1.0, 3.0][attempts - 1],
+                            0.0,
+                            0,
+                            0,
+                            Some(&callback),
+                        )
+                    };
+                    if let Some(timer) = &timer {
+                        CFRunLoop::main()
+                            .unwrap()
+                            .add_timer(Some(timer), unsafe { kCFRunLoopDefaultMode });
+                    }
+                    timer
+                } else {
+                    None
+                };
+                record(
+                    if timer.is_some() {
+                        "process.retry"
+                    } else {
+                        "process.unavailable"
+                    },
+                    Some(pid),
+                    &app_name(&app),
+                    None,
+                    None,
+                    &format!("AX subscription attempt {attempts}/4: {error:?}"),
+                );
+                self.failed.insert(
+                    pid,
+                    PendingProcess {
+                        app,
+                        attempts,
+                        timer,
+                    },
+                );
+            }
         }
     }
 
@@ -331,21 +543,41 @@ impl Monitor {
         let Some(process) = self.processes.get_mut(&pid) else {
             return;
         };
-        if process.app.isTerminated() || !is_system_host(pid) {
+        if process.app.isTerminated() {
             return;
         }
         if let Err(error) = process.scan(&self.permit, self.dry_run) {
+            if process.last_error != Some(error) {
+                record(
+                    "process.read_failed",
+                    Some(pid),
+                    &app_name(&process.app),
+                    None,
+                    None,
+                    &format!("AXWindows: {error:?}"),
+                );
+                process.last_error = Some(error);
+            }
             update_status(|status| {
                 status.state = "partial".into();
                 status.last_result = Some(format!("Cannot read system dialog: {error:?}"));
             });
             debug!(pid, ?error, "cannot inspect system dialogs");
+        } else {
+            process.last_error = None;
         }
     }
 }
 
 impl Drop for Monitor {
     fn drop(&mut self) {
+        unsafe {
+            self.workspace.removeObserver_forKeyPath(
+                &self.applications_observer,
+                ns_string!("runningApplications"),
+            );
+        }
+        self.failed.clear();
         for token in &self.tokens {
             unsafe {
                 self.center.removeObserver((**token).as_ref());
@@ -358,6 +590,9 @@ impl Drop for Monitor {
 struct Dialog {
     element: CFRetained<AXUIElement>,
     last_attempt: Option<String>,
+    last_observation: Option<String>,
+    last_rule: Option<String>,
+    last_button: Option<String>,
     awaiting_close: bool,
     deadline: Option<Instant>,
     timer: Option<CFRetained<CFRunLoopTimer>>,
@@ -376,6 +611,8 @@ struct Process {
     element: CFRetained<AXUIElement>,
     observer: CFRetained<AXObserver>,
     dialogs: Vec<Dialog>,
+    subscriptions: Vec<String>,
+    last_error: Option<AXError>,
 }
 
 impl Process {
@@ -393,17 +630,8 @@ impl Process {
         }
         let observer =
             unsafe { CFRetained::from_raw(NonNull::new(pointer).ok_or(AXError::Failure)?) };
-        let mut subscribed = false;
-        for name in [
-            "AXWindowCreated",
-            "AXSheetCreated",
-            "AXFocusedWindowChanged",
-        ] {
-            subscribed |= subscribe(&observer, &element, name, pid);
-        }
-        if !subscribed {
-            return Err(AXError::NotificationUnsupported);
-        }
+        let subscriptions =
+            process_subscriptions(|name| subscribe(&observer, &element, name, pid))?;
         let source = unsafe { observer.run_loop_source() };
         CFRunLoop::main()
             .unwrap()
@@ -414,23 +642,30 @@ impl Process {
             element,
             observer,
             dialogs: Vec::new(),
+            subscriptions,
+            last_error: None,
         })
     }
 
     fn scan(&mut self, permit: &Mutex<bool>, dry_run: bool) -> std::result::Result<(), AXError> {
+        let pid = self.app.processIdentifier();
+        let app = app_name(&self.app);
         let windows = elements(&self.element, "AXWindows")?;
-        // Only a successful read can prove a previously observed dialog absent.
         self.dialogs.retain(|dialog| {
             let present = windows.iter().any(|window| window == &dialog.element);
             if !present && dialog.awaiting_close {
+                record(
+                    "click.closed",
+                    Some(pid),
+                    &app,
+                    dialog.last_rule.as_deref(),
+                    dialog.last_button.as_deref(),
+                    "window absent after click; original tool result is unknown",
+                );
                 update_status(|status| {
                     status.dialogs_closed += 1;
-                    status.last_result = Some("Dialog closed after Allow".into());
+                    status.last_result = Some("Dialog closed after click".into());
                 });
-                info!(
-                    pid = self.app.processIdentifier(),
-                    "permission dialog closed after Allow"
-                );
             }
             present
         });
@@ -438,6 +673,15 @@ impl Process {
             if !*permit.lock().unwrap_or_else(|e| e.into_inner()) {
                 return Ok(());
             }
+            // A config update waits for any in-flight press; when it returns,
+            // no removed/disabled rule can authorize a subsequent action.
+            let rules_guard = RULES.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(rules) = rules_guard.as_ref() else {
+                return Ok(());
+            };
+            let Some(identity) = app_identity(&self.app) else {
+                return Ok(());
+            };
             let index = match self
                 .dialogs
                 .iter()
@@ -445,11 +689,21 @@ impl Process {
             {
                 Some(index) => index,
                 None => {
-                    let pid = self.app.processIdentifier();
                     watch_dialog(&self.observer, &window, pid);
+                    record(
+                        "window.discovered",
+                        Some(pid),
+                        &app,
+                        None,
+                        None,
+                        "window event or initial window snapshot",
+                    );
                     self.dialogs.push(Dialog {
                         element: window,
                         last_attempt: None,
+                        last_observation: None,
+                        last_rule: None,
+                        last_button: None,
                         awaiting_close: false,
                         deadline: None,
                         timer: None,
@@ -465,45 +719,53 @@ impl Process {
             {
                 dialog.awaiting_close = false;
                 dialog.timer.take();
+                record(
+                    "click.unconfirmed",
+                    Some(pid),
+                    &app,
+                    dialog.last_rule.as_deref(),
+                    dialog.last_button.as_deref(),
+                    "window still present after 3 seconds; click will not be retried",
+                );
                 update_status(|status| {
                     status.last_result =
-                        Some("Allow sent; dialog still present (not retried)".into())
+                        Some("Click sent; window still present (not retried)".into())
                 });
-                warn!(
-                    pid = self.app.processIdentifier(),
-                    "Allow sent but permission dialog is still present"
-                );
             }
-            let Some((button, request)) = allow_button(&dialog.element, permit) else {
-                continue;
+            let matched = match matching_button(&dialog.element, permit, rules, &identity) {
+                Ok(matched) => matched,
+                Err(reason) => {
+                    if dialog.last_observation.as_deref() != Some(reason) {
+                        record("window.skipped", Some(pid), &app, None, None, reason);
+                        dialog.last_observation = Some(reason.into());
+                    }
+                    continue;
+                }
             };
-            // System hosts can reuse a window for the next permission request.
-            // Deduplicate the request, not the lifetime of its outer window.
-            if dialog.last_attempt.as_ref() == Some(&request) {
+            if dialog.last_attempt.as_ref() == Some(&matched.signature) {
                 continue;
             }
+            dialog.last_observation = Some(format!("matched {}", matched.rule));
             if dry_run {
-                dialog.last_attempt = Some(request);
-                update_status(|status| {
-                    status.last_result =
-                        Some("Would allow a directory access request (dry run)".into())
-                });
-                info!(
-                    pid = self.app.processIdentifier(),
-                    "would allow directory access (dry run)"
+                record(
+                    "click.dry_run",
+                    Some(pid),
+                    &app,
+                    Some(&matched.rule),
+                    Some(&matched.label),
+                    "rule matched; no click in dry run",
                 );
+                dialog.last_attempt = Some(matched.signature);
                 continue;
             }
-            // Re-read the target immediately before pressing it. Never use a
-            // default button, a global keystroke, or a cached screen coordinate.
-            let Some((current_button, current_request)) = allow_button(&dialog.element, permit)
-            else {
+            let Ok(current) = matching_button(&dialog.element, permit, rules, &identity) else {
                 continue;
             };
-            if button != current_button
-                || request != current_request
+            if matched.button != current.button
+                || matched.signature != current.signature
+                || matched.rule != current.rule
                 || self.app.isTerminated()
-                || !is_system_host(self.app.processIdentifier())
+                || app_identity(&self.app).as_ref() != Some(&identity)
             {
                 continue;
             }
@@ -511,38 +773,72 @@ impl Process {
             if !*allowed {
                 return Ok(());
             }
-            dialog.last_attempt = Some(request);
+            // Persist intent before mutation; no unaudited press when storage fails.
+            if !record(
+                "click.attempt",
+                Some(pid),
+                &app,
+                Some(&matched.rule),
+                Some(&matched.label),
+                "matched rule; sending AXPress",
+            ) {
+                update_status(|status| {
+                    status.last_result = Some("Click skipped: cannot write event log".into())
+                });
+                continue;
+            }
+            dialog.last_attempt = Some(matched.signature);
+            dialog.last_rule = Some(matched.rule.clone());
+            dialog.last_button = Some(matched.label.clone());
             dialog.awaiting_close = false;
             if let Some(timer) = dialog.timer.take() {
                 timer.invalidate();
             }
-            let result = unsafe { current_button.perform_action(&CFString::from_str("AXPress")) };
+            let result = unsafe {
+                current
+                    .button
+                    .perform_action(&CFString::from_str("AXPress"))
+            };
             drop(allowed);
-            // CannotComplete may mean the target processed the press but did
-            // not acknowledge it. Do not retry an ambiguous action.
             if result == AXError::Success || result == AXError::CannotComplete {
                 dialog.awaiting_close = true;
                 dialog.deadline = Some(Instant::now() + Duration::from_secs(3));
-                dialog.timer = verification_timer(self.app.processIdentifier());
+                dialog.timer = verification_timer(pid);
+                record(
+                    "click.sent",
+                    Some(pid),
+                    &app,
+                    Some(&matched.rule),
+                    Some(&matched.label),
+                    &format!("AXPress: {result:?}; waiting for window to close"),
+                );
                 update_status(|status| {
                     status.clicks_sent += 1;
-                    status.last_result = Some("Allow sent; waiting for dialog to close".into());
+                    status.last_result = Some(format!(
+                        "Clicked {} via {}; waiting for window to close",
+                        matched.label, matched.rule
+                    ));
                 });
                 info!(
-                    pid = self.app.processIdentifier(),
+                    pid,
+                    rule = matched.rule,
+                    button = matched.label,
                     ?result,
-                    "pressed Allow on a directory access request"
+                    "automatic dialog click sent"
                 );
-                queue_scan(self.app.processIdentifier());
+                queue_scan(pid);
             } else {
-                update_status(|status| {
-                    status.last_result = Some(format!("Allow failed: {result:?}"))
-                });
-                warn!(
-                    pid = self.app.processIdentifier(),
-                    ?result,
-                    "cannot press Allow on permission dialog"
+                record(
+                    "click.failed",
+                    Some(pid),
+                    &app,
+                    Some(&matched.rule),
+                    Some(&matched.label),
+                    &format!("AXPress: {result:?}; not retried"),
                 );
+                update_status(|status| {
+                    status.last_result = Some(format!("Click failed: {result:?}"))
+                });
             }
         }
         Ok(())
@@ -560,18 +856,56 @@ impl Drop for Process {
     }
 }
 
-fn subscribe(observer: &AXObserver, element: &AXUIElement, name: &str, pid: i32) -> bool {
-    let result = unsafe {
+fn subscribe(observer: &AXObserver, element: &AXUIElement, name: &str, pid: i32) -> AXError {
+    unsafe {
         observer.add_notification(
             element,
             &CFString::from_str(name),
             pid as isize as *mut c_void,
         )
-    };
-    matches!(
-        result,
-        AXError::Success | AXError::NotificationAlreadyRegistered
-    )
+    }
+}
+
+fn reset_failed<T>(failed: &mut HashMap<i32, T>, pid: Option<i32>, reset: bool) {
+    if reset {
+        failed.clear();
+    } else if let Some(pid) = pid {
+        failed.remove(&pid);
+    }
+}
+
+fn process_subscriptions(
+    mut add: impl FnMut(&str) -> AXError,
+) -> std::result::Result<Vec<String>, AXError> {
+    let mut subscriptions = Vec::new();
+    let mut first_error = None;
+    let mut transient_error = None;
+    for name in [
+        "AXWindowCreated",
+        "AXSheetCreated",
+        "AXFocusedWindowChanged",
+    ] {
+        match add(name) {
+            AXError::Success | AXError::NotificationAlreadyRegistered => {
+                subscriptions.push(name.into())
+            }
+            error @ (AXError::CannotComplete | AXError::InvalidUIElement) => {
+                transient_error.get_or_insert(error);
+            }
+            error => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    // A successful focus subscription must not hide a window subscription
+    // that failed while a newly launched app's AX server was still starting.
+    if let Some(error) = transient_error {
+        Err(error)
+    } else if subscriptions.is_empty() {
+        Err(first_error.unwrap_or(AXError::NotificationUnsupported))
+    } else {
+        Ok(subscriptions)
+    }
 }
 
 fn watch_dialog(observer: &AXObserver, element: &AXUIElement, pid: i32) {
@@ -640,10 +974,20 @@ fn elements(
         .collect())
 }
 
-fn allow_button(
+struct MatchedButton {
+    button: CFRetained<AXUIElement>,
+    signature: String,
+    rule: String,
+    label: String,
+}
+
+fn matching_button(
     window: &AXUIElement,
     permit: &Mutex<bool>,
-) -> Option<(CFRetained<AXUIElement>, String)> {
+    rules: &DialogSettings,
+    identity: &(String, String),
+) -> std::result::Result<MatchedButton, &'static str> {
+    let title = string(window, "AXTitle").map_err(|_| "cannot read window title")?;
     let mut stack = vec![(window.retain(), 0)];
     let mut text = String::new();
     let mut heading = None;
@@ -651,43 +995,37 @@ fn allow_button(
     let mut visited = HashSet::new();
     let deadline = Instant::now() + Duration::from_secs(1);
     while let Some((element, depth)) = stack.pop() {
-        if !*permit.lock().unwrap_or_else(|e| e.into_inner())
-            || visited.len() >= 256
-            || depth > 20
-            || Instant::now() >= deadline
-        {
-            return None;
+        if !*permit.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err("monitor stopped");
+        }
+        if visited.len() >= 256 || depth > 20 || Instant::now() >= deadline {
+            return Err("window inspection budget exceeded");
         }
         if !visited.insert(CFRetained::as_ptr(&element).as_ptr() as usize) {
             continue;
         }
-        let role = string(&element, "AXRole").ok()?;
+        let role = string(&element, "AXRole").map_err(|_| "cannot read element role")?;
         if matches!(role.as_str(), "AXTextField" | "AXTextArea") {
-            return None;
+            return Err("window contains editable or credential fields");
         }
         if role == "AXButton" {
-            let title = string(&element, "AXTitle").ok()?;
+            let title = string(&element, "AXTitle").map_err(|_| "cannot read button title")?;
             let label = if title.is_empty() {
-                string(&element, "AXDescription").ok()?
+                string(&element, "AXDescription").map_err(|_| "cannot read button label")?
             } else {
                 title
             };
-            if is_allow_button(&label) {
-                let enabled = attribute(&element, "AXEnabled")
-                    .ok()?
-                    .downcast::<CFBoolean>()
-                    .ok()?;
-                if enabled.value() {
-                    buttons.push(element.clone());
-                }
+            let enabled = attribute(&element, "AXEnabled")
+                .map_err(|_| "cannot read button state")?
+                .downcast::<CFBoolean>()
+                .map_err(|_| "invalid button state")?;
+            if enabled.value() {
+                buttons.push((element.clone(), label));
             }
         } else if matches!(role.as_str(), "AXStaticText" | "AXHeading") {
-            // AX children are visited in source order. The primary text is the
-            // consent heading; supplementary usage descriptions, container
-            // labels, and icon descriptions must never authorize a press.
-            let value = string(&element, "AXValue").ok()?;
+            let value = string(&element, "AXValue").map_err(|_| "cannot read dialog text")?;
             let value = if value.trim().is_empty() {
-                string(&element, "AXTitle").ok()?
+                string(&element, "AXTitle").map_err(|_| "cannot read dialog text")?
             } else {
                 value
             };
@@ -698,35 +1036,174 @@ fn allow_button(
             }
         }
         if text.len() > 16384 {
-            return None;
+            return Err("window text exceeds inspection limit");
         }
         match elements(&element, "AXChildren") {
             Ok(children) => {
                 stack.extend(children.into_iter().rev().map(|child| (child, depth + 1)))
             }
             Err(AXError::AttributeUnsupported | AXError::NoValue) => {}
-            Err(_) => return None,
+            Err(_) => return Err("cannot read complete window tree"),
         }
     }
-    if heading.as_deref().is_some_and(is_file_access_request) && buttons.len() == 1 {
-        buttons.pop().map(|button| (button, text))
-    } else {
-        None
+    let matches = rules.matching(
+        &identity.0,
+        &identity.1,
+        &title,
+        heading.as_deref().unwrap_or_default(),
+    );
+    let [(rule, selectors)] = matches.as_slice() else {
+        return Err(if matches.is_empty() {
+            "no enabled rule matches this window"
+        } else {
+            "multiple rules match; make selectors more specific"
+        });
+    };
+    buttons.retain(|(_, label)| {
+        if *rule == DIRECTORY_RULE {
+            is_allow_button(label)
+        } else {
+            selectors.button.as_deref() == Some(label.as_str())
+        }
+    });
+    if buttons.len() != 1 {
+        return Err("expected exactly one enabled matching button");
     }
+    let (button, label) = buttons.pop().unwrap();
+    Ok(MatchedButton {
+        button,
+        signature: format!("{title}\n{text}\n{label}"),
+        rule: (*rule).into(),
+        label,
+    })
 }
 
-// Read the real executable path from the kernel, not a display name or bundle
-// identifier supplied by an application. UI hosts must live on the system
-// volume. Arbitrary application windows never reach the consent matcher.
-fn is_system_host(pid: i32) -> bool {
+fn app_name(app: &NSRunningApplication) -> String {
+    app.bundleIdentifier()
+        .map(|s| s.to_string())
+        .or_else(|| app.localizedName().map(|s| s.to_string()))
+        .unwrap_or_else(|| format!("pid {}", app.processIdentifier()))
+}
+
+fn app_identity(app: &NSRunningApplication) -> Option<(String, String)> {
+    executable_path(app.processIdentifier()).map(|path| {
+        (
+            path,
+            app.bundleIdentifier()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+        )
+    })
+}
+
+// Match the kernel-reported executable, never an application display name.
+fn executable_path(pid: i32) -> Option<String> {
     unsafe extern "C" {
         fn proc_pidpath(pid: i32, buffer: *mut c_void, size: u32) -> i32;
     }
     let mut path = [0_i8; 4096];
     let length = unsafe { proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
     if length <= 0 {
-        return false;
+        return None;
     }
-    let path = unsafe { CStr::from_ptr(path.as_ptr()) }.to_string_lossy();
-    path.starts_with("/System/Library/")
+    Some(
+        unsafe { CStr::from_ptr(path.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(test)]
+static KVO_DELIVERIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_foundation::NSObjectNSKeyValueObserverNotification;
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        struct ApplicationListFixture;
+        impl ApplicationListFixture {
+            #[unsafe(method(runningApplications))]
+            fn applications(&self) -> usize { 0 }
+        }
+        unsafe impl NSObjectProtocol for ApplicationListFixture {}
+    );
+
+    #[test]
+    fn lifecycle_events_reset_only_relevant_failed_processes() {
+        let mut failed = HashMap::from([(100, 4), (200, 4)]);
+        reset_failed(&mut failed, None, false);
+        assert_eq!(failed.len(), 2);
+        reset_failed(&mut failed, Some(100), false);
+        assert!(!failed.contains_key(&100));
+        assert_eq!(failed.get(&200), Some(&4));
+        reset_failed(&mut failed, None, true);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn release_regression_transient_subscription_errors_reach_retry_scheduler() {
+        assert_eq!(
+            process_subscriptions(|_| AXError::CannotComplete).unwrap_err(),
+            AXError::CannotComplete
+        );
+        assert_eq!(
+            process_subscriptions(|_| AXError::InvalidUIElement).unwrap_err(),
+            AXError::InvalidUIElement
+        );
+        assert_eq!(
+            process_subscriptions(|_| AXError::NotificationUnsupported).unwrap_err(),
+            AXError::NotificationUnsupported
+        );
+        // A transient window-created failure cannot be hidden by a focus-only success.
+        assert_eq!(
+            process_subscriptions(|name| if name == "AXWindowCreated" {
+                AXError::CannotComplete
+            } else {
+                AXError::Success
+            })
+            .unwrap_err(),
+            AXError::CannotComplete
+        );
+        assert_eq!(
+            process_subscriptions(|name| if name == "AXSheetCreated" {
+                AXError::NotificationUnsupported
+            } else {
+                AXError::Success
+            })
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn kvo_application_list_subscription_delivers_and_unregisters() {
+        // An owned NSObject fixture, never the real desktop or a system UI host.
+        let fixture: Retained<ApplicationListFixture> =
+            unsafe { msg_send![ApplicationListFixture::alloc(), init] };
+        let observer: Retained<ApplicationsObserver> =
+            unsafe { msg_send![ApplicationsObserver::alloc(), init] };
+        let key = ns_string!("runningApplications");
+        unsafe {
+            fixture.addObserver_forKeyPath_options_context(
+                &observer,
+                key,
+                NSKeyValueObservingOptions::empty(),
+                std::ptr::null_mut(),
+            );
+        }
+        let before = KVO_DELIVERIES.load(Ordering::SeqCst);
+        fixture.willChangeValueForKey(key);
+        fixture.didChangeValueForKey(key);
+        assert_eq!(KVO_DELIVERIES.load(Ordering::SeqCst), before + 1);
+        unsafe {
+            fixture.removeObserver_forKeyPath(&observer, key);
+        }
+        fixture.willChangeValueForKey(key);
+        fixture.didChangeValueForKey(key);
+        assert_eq!(KVO_DELIVERIES.load(Ordering::SeqCst), before + 1);
+    }
 }

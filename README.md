@@ -47,7 +47,7 @@ Install a specific version or destination when reproducibility matters:
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.sh \
-  | WATCHCAT_VERSION=v0.6.0 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
+  | WATCHCAT_VERSION=v0.7.0 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
 ```
 
 Building from source requires Rust 1.85 or newer:
@@ -98,35 +98,73 @@ Service management uses launchd on macOS and systemd user services on Linux.
 Uninstalling the service preserves all configuration, watchlists, and history.
 Service lifecycle is the only global on/off control. There is no separate guard switch.
 
-## macOS directory permission dialogs
+## macOS window rules and event logs
 
-While the service runs, Watchcat subscribes to macOS application and
-Accessibility events and automatically presses **Allow** on recognized system
-requests to access folders, external volumes, and network volumes. It also
-checks dialogs already open when it starts. There is no periodic desktop scan,
-new configuration, or per-app/per-directory list to maintain.
+Watchcat subscribes to `NSWorkspace.runningApplications` changes with KVO,
+including newly launched background and `LSUIElement` apps, then installs an
+Accessibility observer for each matching app. Existing apps and windows are
+checked once at startup. New window, sheet, focus, and layout events trigger
+rule matching; there is no periodic desktop scan. A newly discovered app whose
+AX interface is temporarily unavailable gets at most four subscription attempts
+through one-shot callbacks, not repeated clicks.
 
-Grant the installed `watchcatd` executable Accessibility access once in
+Grant the installed `watchcatd` executable Accessibility access in
 **System Settings → Privacy & Security → Accessibility**, then restart the
-service. Grant access to the daemon itself, not just the terminal. Keep its
-installation path stable and check permission again after replacing the binary.
-`watchcat service status` reports whether this feature needs permission, is
-listening, or has incomplete coverage, along with its latest result.
+service. `watchcat service status` shows permission readiness, observer counts,
+unavailable candidates, and click results. An observer count is not proof that a
+particular permission dialog can be handled; inspect the event log for coverage.
 
-This applies to the current user's desktop, including requests from apps outside
-the session watchlist. Recognition is limited to known English and Chinese
-Desktop, Documents, Downloads, removable-volume, and network-volume headings.
-Password prompts, unrelated permission categories, and ordinary
-application dialogs are not auto-approved. Watchcat uses the button's
-Accessibility action without moving the mouse or sending global keystrokes.
-`watchcatd --dry-run` observes but never clicks; stopping the service prevents
-further clicks. Previously granted OS permissions remain granted.
+The built-in `directory-access` rule handles known English and Chinese Desktop,
+Documents, Downloads, removable-volume, and network-volume consent headings on
+system-owned UI hosts. It is enabled by default and applies across the desktop,
+independently of session membership. Add custom window rules through the CLI:
 
-Dialog handling requires a logged-in desktop and a system UI host that exposes
-the relevant Accessibility notifications and button action. It cannot guarantee
-operation at the lock screen or on an unverified macOS release. “Dialog closed”
-does not mean the original tool call succeeded. Dialog handling results appear
-in the existing daemon logs; no screenshots or full dialog text are stored.
+```bash
+watchcat config dialog list
+watchcat config dialog set helper-ready --app org.example.Helper \
+  --title "Ready to continue" --button "Continue"
+watchcat config dialog disable helper-ready
+watchcat config dialog enable helper-ready
+watchcat config dialog remove helper-ready
+watchcat config dialog disable directory-access
+```
+
+`--app` matches an exact bundle ID or absolute executable path of the **window
+owner**, which can differ from the app requesting access. `--title` matches the
+exact window title; `--text` matches text within the primary dialog heading.
+Specify at least one of them; when both are present both must match. `--button`
+matches an exact enabled button label. Rules cannot press ambiguous buttons or
+windows matching multiple rules, and windows containing editable/credential
+fields are skipped. Custom rules authorize their specified button beyond the
+built-in directory-consent categories; keep selectors specific.
+
+Rules are stored under `[dialogs.rules.NAME]` in the existing TOML config and
+apply immediately through the CLI. Direct file edits use the existing config
+hot reload. No restart is needed for rule changes. Rule commands require the
+service; log commands also work after it stops.
+
+```bash
+watchcat service logs --limit 30
+watchcat service logs --clicks --limit 50
+watchcat service logs --json
+```
+
+Logs show local time with timezone, event, app/PID, rule, button, and outcome.
+They distinguish process discovery, successful subscriptions (including AX event
+names), unavailable AX interfaces, skipped windows, click intent, click sent,
+window closed, and unconfirmed results. `click.sent` does not mean the window
+closed or the original tool succeeded. Repeated identical skip reasons are
+collapsed per window. Events persist in `dialog-events.jsonl` alongside the
+existing daemon logs and use `engine.log_retention`; full window text and
+screenshots are not stored. Counters in service status cover the current daemon
+run; event logs survive restarts. History starts with this implementation and
+cannot recover click records absent from earlier versions.
+
+`watchcatd --dry-run` records matches without clicking. Stopping the service
+prevents further clicks; it does not revoke permissions already granted by
+macOS. A logged-in desktop and an AX-capable window owner are required. KVO
+covers applications represented by NSWorkspace, not every arbitrary Unix
+process. Real macOS permission prompt compatibility remains unverified.
 
 ## Watchlist and lifecycle
 

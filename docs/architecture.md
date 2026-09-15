@@ -6,28 +6,34 @@ On macOS, `watchcatd` keeps a Core Foundation run loop on the main thread for
 NSWorkspace and AXObserver notifications; the Tokio runtime and provider work
 run on a separate thread. The OS dialog monitor starts after acquiring the
 daemon lock and before loading providers. It handles directory consent
-independently of session recovery, without a config flag or provider dependency.
+independently of session recovery, using configured window rules with no provider dependency.
 
-Application launch/exit/activation, wake, and session activation events maintain
-per-process observers for UI hosts whose kernel-reported executable is under
-`/System/Library/`. The monitor subscribes before inspecting existing windows.
-AX callbacks coalesce work by PID and defer inspection until after the callback.
-Window creation, sheet creation, focus, layout, and destruction drive subsequent
-work. There is no polling fallback; unsupported notification sources make
-coverage partial. NSWorkspace is an application lifecycle API, not a guarantee
-of observing every background process or every OS permission UI.
+KVO on `NSWorkspace.runningApplications` detects new and exiting apps, including
+background/LSUIElement apps omitted from launch notifications. App lifecycle,
+wake, and session notifications supplement that subscription. Matching window
+owners are selected by enabled rules: the built-in rule requires a kernel path
+under `/System/Library/`; custom rules require an exact bundle ID or executable
+path. Subscribe before inspecting existing windows. Failed transient attachment
+gets at most four one-shot attempts per process lifetime. Unsupported AX hosts
+are reported in structured events. No process or desktop polling is added.
 
-Only a complete primary directory-consent heading with one enabled Allow button
-can cause a press. Application explanations and container descriptions cannot
-authorize an action. A second read checks the same request and button immediately before the
-action. Request text is kept only in memory to avoid repeating a press while
-allowing a reused window to display a different request. A one-shot three-second
-deadline verifies unresolved clicks; missing read results never count as a
-closed dialog. The click permit is revoked synchronously on shutdown before
-provider cleanup. UI activity does not change session recovery metrics.
+A primary consent heading or explicitly configured window selectors, plus one
+enabled matching button, authorizes a press. Multiple matching rules and
+editable fields prevent it. A second read verifies the same target immediately
+before AXPress. The rule lock synchronizes updates with in-flight presses;
+stopping revokes the click permit before provider cleanup. Request signatures
+stay in memory for deduplication. Click intent is persisted before mutation; a
+write failure prevents the press. One-shot close verification distinguishes a
+closed window from a sent or unconfirmed action.
+
+`config.dialogs.set` atomically validates/persists the complete rule set under
+revision control and applies it immediately. `service logs` reads bounded,
+persistent `dialog-events.jsonl` history even while the daemon is stopped. It
+records app/PID, rule, button and result without full window text. It shares the
+existing log retention limit; no provider calls are required.
 
 `snapshot.get` includes an additive `os_permissions` status object with `state`,
-`listening_processes`, `clicks_sent`, `dialogs_closed`, and `last_result`. Existing
+`listening_processes`, `unavailable_processes`, `clicks_sent`, `dialogs_closed`, and `last_result`. Existing
 config/state schema versions and RPC version remain unchanged. Linux reports
 this feature as unsupported and does not link the macOS frameworks.
 

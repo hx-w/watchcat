@@ -2,6 +2,33 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-09-15
+
+### Added
+
+- Custom window click rules through `watchcat config dialog`, with immediate
+  updates, exact app/button selectors, and title/primary-text matching.
+- Persistent CLI event logs through `watchcat service logs` and `--clicks`,
+  including timestamps, process identity, rule, button, and confirmed/unconfirmed outcomes.
+
+### Fixed
+
+- Observe `NSWorkspace.runningApplications` using KVO to discover background and
+  LSUIElement app launches omitted from ordinary workspace notifications.
+- Report actual AX subscription names and unavailable hosts; retry only transient
+  subscription failures with a bounded one-shot sequence. Activation and wake
+  events recover hosts that exhausted their startup retries.
+- Recover interrupted dialog-log appends without corrupting subsequent records.
+- Start the dialog monitor and control plane from the same configuration snapshot.
+
+### Compatibility
+
+- Existing 0.6.0 configuration remains compatible. Upgrade both binaries together
+  and check Accessibility access for the installed `watchcatd` after replacement.
+- Configuration containing the new `[dialogs]` section requires 0.7.0 or later;
+  restore a saved older configuration before downgrading.
+- Live macOS permission prompts have not yet been verified.
+
 ## [0.6.0] - 2026-09-15
 
 ### Added

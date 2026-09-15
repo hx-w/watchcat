@@ -295,6 +295,8 @@ pub struct WatchcatDaemon {
 
 impl WatchcatDaemon {
     pub async fn load(paths: Paths) -> Result<Self> {
+        // Capture before reading so an edit during startup triggers a reload.
+        let config_modified = modified_time(&paths.config_file);
         let settings = load_settings(&paths.config_file)?;
         let watchlist = WatchlistStore::new(paths.watchlist_file.clone());
         let targets = watchlist.list()?;
@@ -311,7 +313,6 @@ impl WatchcatDaemon {
         let recovery_permit = RecoveryPermit::new(true, &targets, control_state.revision());
         let event_log =
             EventLogStore::new(paths.event_log_file.clone(), settings.engine.log_retention);
-        let config_modified = modified_time(&paths.config_file);
         Ok(Self {
             paths,
             watchlist,
@@ -493,6 +494,7 @@ impl WatchcatDaemon {
         match load_settings(&self.paths.config_file) {
             Ok(settings) => {
                 self.bump_revision()?;
+                crate::os_permissions::configure(settings.dialogs.clone());
                 self.settings = settings;
                 self.config_modified = modified;
                 info!(revision = self.revision(), "configuration hot-reloaded");
@@ -638,6 +640,18 @@ impl WatchcatDaemon {
                 self.config_modified = modified_time(&self.paths.config_file);
                 self.settings = settings;
                 Ok(json!({"reset": true}))
+            }
+            "config.dialogs.set" => {
+                self.check_revision(request)?;
+                let mut settings = self.settings.clone();
+                settings.dialogs = decode(&request.params)?;
+                settings.validate()?;
+                self.bump_revision()?;
+                save_settings(&self.paths.config_file, &settings)?;
+                crate::os_permissions::configure(settings.dialogs.clone());
+                self.config_modified = modified_time(&self.paths.config_file);
+                self.settings = settings;
+                Ok(json!({"updated": true}))
             }
             "config.get" => serde_json::to_value(&self.settings).map_err(Into::into),
             "config.set_lifecycle" => {
@@ -911,7 +925,6 @@ pub async fn serve(paths: Paths, dry_run: bool) -> Result<()> {
 
     let mut terminate = signal(SignalKind::terminate())?;
     let _lock = ProcessLock::acquire(paths.lock_file.clone())?;
-    let os_permissions = crate::os_permissions::start(dry_run);
     if let Some(parent) = paths.socket_file.parent() {
         fs::create_dir_all(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
@@ -931,6 +944,7 @@ pub async fn serve(paths: Paths, dry_run: bool) -> Result<()> {
     let _socket_cleanup = SocketCleanup(socket_path.clone());
     let retry_operations_path = paths.retry_operations_file.clone();
     let control = WatchcatDaemon::load(paths).await?;
+    let os_permissions = crate::os_permissions::start(dry_run, &control.paths, &control.settings)?;
     let engine = Arc::new(Mutex::new(control.build_engine(dry_run)?));
     let daemon = Arc::new(Mutex::new(control));
     let retry_operations = Arc::new(Mutex::new(RetryOperationRegistry::load(
@@ -1453,6 +1467,7 @@ fn is_mutation(method: &str) -> bool {
             | "config.policies.set"
             | "config.policies.reset"
             | "config.set_lifecycle"
+            | "config.dialogs.set"
     )
 }
 

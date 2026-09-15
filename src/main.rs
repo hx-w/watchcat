@@ -103,6 +103,11 @@ enum PolicyCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Configure automatic window-click rules.
+    Dialog {
+        #[command(subcommand)]
+        command: DialogCommand,
+    },
     /// Inspect and edit recovery policies stored in this configuration.
     Policy {
         #[command(subcommand)]
@@ -119,6 +124,37 @@ enum ConfigCommand {
     Path(OutputArgs),
     /// Validate the effective configuration.
     Validate(OutputArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DialogCommand {
+    /// Show all configured rules, including the built-in directory-access rule.
+    List(OutputArgs),
+    /// Create or replace a custom rule; all specified selectors must match.
+    Set {
+        name: String,
+        /// Exact bundle ID or absolute executable path of the window owner.
+        #[arg(long)]
+        app: String,
+        /// Exact window title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Text contained in the primary dialog heading.
+        #[arg(long)]
+        text: Option<String>,
+        /// Exact button label to press.
+        #[arg(long)]
+        button: String,
+    },
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -256,7 +292,11 @@ async fn run() -> Result<()> {
                                     "OS dialogs: needs Accessibility permission for watchcatd (System Settings → Privacy & Security → Accessibility)"
                                 ),
                                 _ => println!(
-                                    "OS dialogs: {state} · {} Allow clicks · {} dialogs closed",
+                                    "OS dialogs: {state} · {} observers · {} unavailable · {} clicks · {} dialogs closed",
+                                    value["os_permissions"]["listening_processes"],
+                                    value["os_permissions"]["unavailable_processes"]
+                                        .as_u64()
+                                        .unwrap_or(0),
                                     value["os_permissions"]["clicks_sent"],
                                     value["os_permissions"]["dialogs_closed"]
                                 ),
@@ -278,6 +318,70 @@ async fn run() -> Result<()> {
                     }
                 }
             }
+        }
+        Command::Service {
+            command:
+                service::ServiceCommand::Logs {
+                    limit,
+                    clicks,
+                    json,
+                },
+        } => {
+            let entries = watchcat::os_permissions::events::read(
+                &watchcat::os_permissions::events::path(&paths.socket_file),
+                clicks,
+                limit as usize,
+            )?;
+            if json {
+                emit_serializable(&entries, true)?;
+            } else if entries.is_empty() {
+                println!(
+                    "No {} recorded.",
+                    if clicks {
+                        "automatic clicks"
+                    } else {
+                        "dialog events"
+                    }
+                );
+            } else {
+                let clean = |value: &str| {
+                    value
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .collect::<String>()
+                };
+                println!("TIME (local)                      EVENT                  APP (PID)");
+                for event in entries {
+                    println!(
+                        "{}  {:<22} {} ({})",
+                        event
+                            .timestamp
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M:%S%.3f %:z"),
+                        clean(&event.kind),
+                        clean(&event.app),
+                        event
+                            .pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    );
+                    if let Some(rule) = &event.rule {
+                        println!(
+                            "  rule={}  button={}  {}",
+                            clean(rule),
+                            clean(event.button.as_deref().unwrap_or("-")),
+                            clean(&event.detail)
+                        );
+                    } else {
+                        println!("  {}", clean(&event.detail));
+                    }
+                }
+            }
+        }
+        Command::Config {
+            command: ConfigCommand::Dialog { command },
+        } => {
+            dialog_command(&WatchcatClient::new(paths.socket_file.clone()), command).await?;
         }
         Command::Service { command } => service::run(command, &paths)?,
         Command::Config {
@@ -519,6 +623,92 @@ async fn session_command(client: &WatchcatClient, command: SessionCommand) -> Re
     }
 }
 
+async fn dialog_command(client: &WatchcatClient, command: DialogCommand) -> Result<()> {
+    use watchcat::os_permissions::rules::{DialogRule, DialogSettings};
+    let (value, revision) = client.request("config.get", json!({}), None).await?;
+    let mut settings: DialogSettings = serde_json::from_value(value["dialogs"].clone())
+        .context("daemon does not support dialog rules; upgrade watchcatd together with the CLI")?;
+    match command {
+        DialogCommand::List(args) => {
+            if args.json {
+                return emit_serializable(&settings, true);
+            }
+            let rows = settings
+                .rules
+                .iter()
+                .map(|(name, r)| {
+                    vec![
+                        name.clone(),
+                        if r.enabled { "enabled" } else { "disabled" }.into(),
+                        r.app
+                            .clone()
+                            .unwrap_or_else(|| "system directory consent".into()),
+                        r.title.clone().unwrap_or_else(|| "-".into()),
+                        r.text.clone().unwrap_or_else(|| "-".into()),
+                        r.button
+                            .clone()
+                            .unwrap_or_else(|| "Allow / OK (localized)".into()),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(&["RULE", "STATE", "APP", "TITLE", "TEXT", "BUTTON"], &rows);
+            return Ok(());
+        }
+        DialogCommand::Set {
+            name,
+            app,
+            title,
+            text,
+            button,
+        } => {
+            settings.rules.insert(
+                name,
+                DialogRule {
+                    enabled: true,
+                    app: Some(app),
+                    title,
+                    text,
+                    button: Some(button),
+                },
+            );
+        }
+        DialogCommand::Enable { name } => {
+            if name == watchcat::os_permissions::rules::DIRECTORY_RULE {
+                settings.rules.entry(name).or_default().enabled = true;
+            } else {
+                settings
+                    .rules
+                    .get_mut(&name)
+                    .context("dialog rule not found")?
+                    .enabled = true;
+            }
+        }
+        DialogCommand::Disable { name } => {
+            settings
+                .rules
+                .get_mut(&name)
+                .context("dialog rule not found")?
+                .enabled = false
+        }
+        DialogCommand::Remove { name } => {
+            settings
+                .rules
+                .remove(&name)
+                .context("dialog rule not found")?;
+        }
+    }
+    settings.validate()?;
+    client
+        .request(
+            "config.dialogs.set",
+            serde_json::to_value(&settings)?,
+            Some(revision),
+        )
+        .await?;
+    println!("Updated dialog rules; applied to the running service.");
+    Ok(())
+}
+
 async fn policy_command(client: &WatchcatClient, command: PolicyCommand) -> Result<()> {
     let (_, revision) = client.request("snapshot.get", json!({}), None).await?;
     match command {
@@ -648,7 +838,9 @@ fn config_command(settings: &Settings, paths: &Paths, command: ConfigCommand) ->
             Ok(())
         }
         ConfigCommand::Path(args) => emit_value(&path_value(paths), args.json),
-        ConfigCommand::Init { .. } | ConfigCommand::Policy { .. } => unreachable!(),
+        ConfigCommand::Init { .. }
+        | ConfigCommand::Policy { .. }
+        | ConfigCommand::Dialog { .. } => unreachable!(),
     }
 }
 
