@@ -249,6 +249,22 @@ async fn run() -> Result<()> {
                             "Watchcat service online · {} sessions · {} need attention",
                             value["watched"], value["attention"]
                         );
+                        if let Some(state) = value["os_permissions"]["state"].as_str() {
+                            match state {
+                                "unsupported" | "not_started" => {}
+                                "accessibility_required" => println!(
+                                    "OS dialogs: needs Accessibility permission for watchcatd (System Settings → Privacy & Security → Accessibility)"
+                                ),
+                                _ => println!(
+                                    "OS dialogs: {state} · {} Allow clicks · {} dialogs closed",
+                                    value["os_permissions"]["clicks_sent"],
+                                    value["os_permissions"]["dialogs_closed"]
+                                ),
+                            }
+                            if let Some(result) = value["os_permissions"]["last_result"].as_str() {
+                                println!("  {result}");
+                            }
+                        }
                     }
                 }
                 Err(error) => {

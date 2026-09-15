@@ -1,6 +1,6 @@
 [package]
 name = "watchcat"
-version = "0.5.0"
+version = "0.6.0"
 default-run = "watchcat"
 edition = "2024"
 rust-version = "1.85"
@@ -33,6 +33,14 @@ uuid = { version = "1.18", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "libc"] }
+objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "HIServices", "AXUIElement", "AXError", "libc"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFString", "CFNumber", "CFRunLoop", "CFDate", "block2"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSNotification", "NSOperation", "NSString", "NSURL", "block2"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

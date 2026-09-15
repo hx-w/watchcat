@@ -10,6 +10,25 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::{TempDir, tempdir};
 
+// A test daemon must never accept permission prompts on the developer's real
+// desktop, even if their installed Watchcat already has Accessibility access.
+// Restrict only the child process; no machine settings or product flags change.
+#[cfg(unix)]
+fn daemon_command() -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
+        command.args([
+            "-p",
+            r#"(version 1)(allow default)(deny mach-lookup (global-name-regex "^com\\.apple\\.(tccd|axserver).*"))"#,
+            env!("CARGO_BIN_EXE_watchcatd"),
+        ]);
+        command
+    }
+    #[cfg(not(target_os = "macos"))]
+    std::process::Command::new(env!("CARGO_BIN_EXE_watchcatd"))
+}
+
 struct Isolated {
     directory: TempDir,
 }
@@ -54,7 +73,7 @@ impl Isolated {
         }
         let state_dir = self.directory.path().join("state");
         let mut daemon = Daemon(
-            std::process::Command::new(env!("CARGO_BIN_EXE_watchcatd"))
+            daemon_command()
                 .env("CLAUDE_CONFIG_DIR", self.directory.path().join("claude"))
                 .env("WATCHCAT_CONFIG_DIR", config_dir)
                 .env("WATCHCAT_STATE_DIR", &state_dir)
@@ -168,6 +187,47 @@ fn runtime_commands_require_the_server_even_with_a_stale_socket() {
 
 #[cfg(unix)]
 #[test]
+fn service_status_reports_desktop_permission_readiness() {
+    let isolated = Isolated::new();
+    let mut daemon = isolated.start_daemon();
+    let socket = isolated.directory.path().join("state/watchcat.sock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, response) = rpc_request(&socket, "os-status", "snapshot.get").unwrap();
+        let status = &response["result"]["os_permissions"];
+        let expected = if cfg!(target_os = "macos") {
+            "accessibility_required" // The test process is sandboxed above.
+        } else {
+            "unsupported"
+        };
+        if status["state"] == expected {
+            assert_eq!(status["clicks_sent"], 0);
+            assert_eq!(response["result"]["service_online"], true);
+            break;
+        }
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited during permission setup"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "unexpected OS permission status: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    #[cfg(target_os = "macos")]
+    isolated
+        .command()
+        .args(["service", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "needs Accessibility permission for watchcatd",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
 fn membership_and_manual_exclusion_survive_restart() {
     let isolated = Isolated::new();
     let daemon = isolated.start_daemon();
@@ -215,7 +275,7 @@ fn event_subscriptions_are_bounded_and_disconnections_release_capacity() {
     .unwrap();
     let state_dir = isolated.directory.path().join("state");
     let socket = state_dir.join("watchcat.sock");
-    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_watchcatd"))
+    let mut daemon = daemon_command()
         .env(
             "CLAUDE_CONFIG_DIR",
             isolated.directory.path().join("claude"),
@@ -309,7 +369,7 @@ done
     )
     .unwrap();
 
-    let mut daemon_command = std::process::Command::new(env!("CARGO_BIN_EXE_watchcatd"));
+    let mut daemon_command = daemon_command();
     daemon_command
         .env("WATCHCAT_CONFIG_DIR", &config_dir)
         .env("WATCHCAT_STATE_DIR", &state_dir)
@@ -406,7 +466,7 @@ done
     .unwrap();
 
     let socket = state_dir.join("watchcat.sock");
-    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_watchcatd"))
+    let mut daemon = daemon_command()
         .env(
             "CLAUDE_CONFIG_DIR",
             isolated.directory.path().join("claude"),

@@ -669,6 +669,7 @@ impl WatchcatDaemon {
             attention_target_keys: self.attention_target_keys.clone(),
             automatic_recoveries: self.metrics.automatic_recoveries,
             hands_free_percent: self.metrics.hands_free_percent,
+            os_permissions: crate::os_permissions::status(),
         })
     }
 
@@ -910,6 +911,7 @@ pub async fn serve(paths: Paths, dry_run: bool) -> Result<()> {
 
     let mut terminate = signal(SignalKind::terminate())?;
     let _lock = ProcessLock::acquire(paths.lock_file.clone())?;
+    let os_permissions = crate::os_permissions::start(dry_run);
     if let Some(parent) = paths.socket_file.parent() {
         fs::create_dir_all(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
@@ -1409,6 +1411,7 @@ pub async fn serve(paths: Paths, dry_run: bool) -> Result<()> {
         }
     };
     shutting_down.store(true, std::sync::atomic::Ordering::Release);
+    os_permissions.stop();
     let (targets, revision, permit) = {
         let daemon = daemon.lock().await;
         (

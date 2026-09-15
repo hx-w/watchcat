@@ -24,9 +24,18 @@ struct Cli {
     lock_ready: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    let task = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(run())
+    };
+    #[cfg(target_os = "macos")]
+    let result = watchcat::os_permissions::run_main(task);
+    #[cfg(not(target_os = "macos"))]
+    let result: Result<()> = task();
+    if let Err(error) = result {
         eprintln!("watchcatd: {error:#}");
         std::process::exit(2);
     }

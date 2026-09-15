@@ -2,6 +2,40 @@
 
 Watchcat consists of a CLI and a long-running background reliability service.
 
+On macOS, `watchcatd` keeps a Core Foundation run loop on the main thread for
+NSWorkspace and AXObserver notifications; the Tokio runtime and provider work
+run on a separate thread. The OS dialog monitor starts after acquiring the
+daemon lock and before loading providers. It handles directory consent
+independently of session recovery, without a config flag or provider dependency.
+
+Application launch/exit/activation, wake, and session activation events maintain
+per-process observers for UI hosts whose kernel-reported executable is under
+`/System/Library/`. The monitor subscribes before inspecting existing windows.
+AX callbacks coalesce work by PID and defer inspection until after the callback.
+Window creation, sheet creation, focus, layout, and destruction drive subsequent
+work. There is no polling fallback; unsupported notification sources make
+coverage partial. NSWorkspace is an application lifecycle API, not a guarantee
+of observing every background process or every OS permission UI.
+
+Only a complete primary directory-consent heading with one enabled Allow button
+can cause a press. Application explanations and container descriptions cannot
+authorize an action. A second read checks the same request and button immediately before the
+action. Request text is kept only in memory to avoid repeating a press while
+allowing a reused window to display a different request. A one-shot three-second
+deadline verifies unresolved clicks; missing read results never count as a
+closed dialog. The click permit is revoked synchronously on shutdown before
+provider cleanup. UI activity does not change session recovery metrics.
+
+`snapshot.get` includes an additive `os_permissions` status object with `state`,
+`listening_processes`, `clicks_sent`, `dialogs_closed`, and `last_result`. Existing
+config/state schema versions and RPC version remain unchanged. Linux reports
+this feature as unsupported and does not link the macOS frameworks.
+
+CLI integration tests sandbox the macOS daemon's access to TCC/Accessibility
+services, so `cargo test` cannot click real desktop permission prompts even on
+an already-authorized development machine. Those tests verify service lifecycle
+and permission-unavailable behavior; they do not prove real dialog compatibility.
+
 ```text
                    watchcat CLI
                          |

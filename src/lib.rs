@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod engine;
 pub mod models;
+pub mod os_permissions;
 pub mod protocol;
 pub mod providers;
 pub mod state;

@@ -20,6 +20,14 @@ it. Protect the config, watchlist, and state directories from other users. The
 watchlist is an authorization boundary: anyone who can edit it can authorize a
 session for automatic continuation.
 
+On macOS, running the service with Accessibility permission also authorizes
+automatic acceptance of recognized OS directory/volume access dialogs across
+the current user's desktop, independently of session membership. The monitor
+checks the UI host's actual system executable path, recognizes the permission
+request, and presses its enabled Allow button. It does not grant itself
+Accessibility access or edit the TCC database. Service stop revokes future
+clicks; it does not revoke directory access already granted by macOS.
+
 Watchcat intentionally has no TCP or HTTP server, telemetry, or credential
 store. `watchcatd` exposes only a local versioned RPC endpoint.
 

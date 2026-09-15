@@ -133,6 +133,8 @@ pub struct Snapshot {
     pub attention_target_keys: Vec<String>,
     pub automatic_recoveries: usize,
     pub hands_free_percent: u8,
+    #[serde(default)]
+    pub os_permissions: crate::os_permissions::Status,
 }
 
 fn default_provider() -> String {

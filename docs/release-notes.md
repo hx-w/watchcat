@@ -1,18 +1,18 @@
-Watchcat 0.5.0 runs as a CLI and a background service on macOS and Linux. The
-native macOS app is removed. The CLI now has three command groups: `service`,
-`session`, and `config`; recovery policies live under `config policy`, and
-service start/stop replaces the separate guard switch.
+Watchcat 0.6.0 adds event-driven handling of recognized macOS directory and
+volume permission dialogs. While the service runs, it subscribes to system
+application and Accessibility events and presses Allow on supported requests,
+including removable and network volumes. No new configuration or periodic
+desktop scan is needed. Service status shows readiness and the latest result.
 
-The service automatically discovers recent Codex and Claude Code sessions and
-removes entries after three days without activity. Manual add and remove remain
-available: removed sessions stay excluded until added again, while automatically
-expired sessions rejoin when new activity appears. Codex supports automatic
-recovery, send, and interrupt. Claude Code supports discovery and logs only.
+Grant the installed `watchcatd` executable Accessibility access once in System
+Settings, then restart the service. This applies across the current desktop,
+including apps outside the session watchlist. Recognition uses known English
+and Chinese directory-consent headings; passwords and unrelated permission
+categories are excluded. Live macOS permission prompts have not yet been
+verified, and other languages or system dialog layouts may remain unhandled.
 
-This release intentionally breaks compatibility with older commands, RPC, and
-configuration. Stop the old service, back up the paths printed by
-`watchcat config path`, and reset configuration and membership state before
-starting 0.5.0; see the README for schema versions and setup. Upgrade `watchcat`
-and `watchcatd` together. Provider conversations are not deleted by cleanup.
+Upgrade `watchcat` and `watchcatd` together. Existing 0.5.0 configuration and state
+remain compatible, and Linux behavior is unchanged. Stopping the service stops
+further clicks; permissions already granted remain granted.
 
-**Full Changelog**: https://github.com/hx-w/watchcat/compare/v0.4.0...v0.5.0
+**Full Changelog**: https://github.com/hx-w/watchcat/compare/v0.5.0...v0.6.0

@@ -2,6 +2,29 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-09-15
+
+### Added
+
+- Event-driven macOS handling of recognized directory and volume permission
+  dialogs, with no new configuration or periodic desktop scans.
+- Permission readiness and dialog-action results in `watchcat service status`.
+- Sandboxed macOS daemon integration tests that cannot approve desktop prompts.
+
+### Changed
+
+- Keep macOS Accessibility observers on the main run loop while provider work
+  runs independently; revoke click permission before service shutdown.
+- Require a complete primary directory-consent heading before pressing Allow,
+  excluding application explanations and unrelated permission categories.
+
+### Compatibility
+
+- Grant the installed `watchcatd` binary Accessibility access and restart once.
+  Upgrade both binaries together; 0.5.0 configuration and state remain compatible.
+- Live macOS permission prompts have not yet been verified. Supported headings
+  are limited to known English and Chinese folder and volume requests.
+
 ## [0.5.0] - 2026-09-09
 
 ### Removed

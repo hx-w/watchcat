@@ -47,7 +47,7 @@ Install a specific version or destination when reproducibility matters:
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://raw.githubusercontent.com/hx-w/watchcat/main/scripts/install.sh \
-  | WATCHCAT_VERSION=v0.5.0 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
+  | WATCHCAT_VERSION=v0.6.0 WATCHCAT_INSTALL_DIR="$HOME/bin" sh
 ```
 
 Building from source requires Rust 1.85 or newer:
@@ -97,6 +97,36 @@ watchcat service uninstall
 Service management uses launchd on macOS and systemd user services on Linux.
 Uninstalling the service preserves all configuration, watchlists, and history.
 Service lifecycle is the only global on/off control. There is no separate guard switch.
+
+## macOS directory permission dialogs
+
+While the service runs, Watchcat subscribes to macOS application and
+Accessibility events and automatically presses **Allow** on recognized system
+requests to access folders, external volumes, and network volumes. It also
+checks dialogs already open when it starts. There is no periodic desktop scan,
+new configuration, or per-app/per-directory list to maintain.
+
+Grant the installed `watchcatd` executable Accessibility access once in
+**System Settings → Privacy & Security → Accessibility**, then restart the
+service. Grant access to the daemon itself, not just the terminal. Keep its
+installation path stable and check permission again after replacing the binary.
+`watchcat service status` reports whether this feature needs permission, is
+listening, or has incomplete coverage, along with its latest result.
+
+This applies to the current user's desktop, including requests from apps outside
+the session watchlist. Recognition is limited to known English and Chinese
+Desktop, Documents, Downloads, removable-volume, and network-volume headings.
+Password prompts, unrelated permission categories, and ordinary
+application dialogs are not auto-approved. Watchcat uses the button's
+Accessibility action without moving the mouse or sending global keystrokes.
+`watchcatd --dry-run` observes but never clicks; stopping the service prevents
+further clicks. Previously granted OS permissions remain granted.
+
+Dialog handling requires a logged-in desktop and a system UI host that exposes
+the relevant Accessibility notifications and button action. It cannot guarantee
+operation at the lock screen or on an unverified macOS release. “Dialog closed”
+does not mean the original tool call succeeded. Dialog handling results appear
+in the existing daemon logs; no screenshots or full dialog text are stored.
 
 ## Watchlist and lifecycle
 
@@ -176,7 +206,8 @@ is automatic successful recoveries divided by all successful recoveries.
 
 ## Safety invariants
 
-- Only current managed sessions can change automatically; exclusions revoke recovery.
+- Automatic session continuations require current watchlist membership; exclusions revoke recovery.
+- macOS directory consent is desktop-wide and follows the service lifecycle, independently of the watchlist.
 - Each failed turn is handled at most once.
 - Every retry is delayed and bounded.
 - The failed turn is rechecked immediately before a continuation is sent.
